@@ -161,12 +161,14 @@ function registerAssessTool(pi: ExtensionAPI): void {
 					);
 				}
 
-				// Ready to execute
-				setState(result.state, ctx);
-				return textResult(
-					`评估结果：任务可执行。复杂度 ${assessment.complexity}，预算 ${result.budget?.maxToolCalls ?? 0} 次工具调用。\n\n` +
-						"使用 submit_task_result 提交执行结果。",
-				);
+				// Ready to execute — auto-start the task
+				const started = await tryStartNextTask(result.state, ctx);
+				if (started.error) {
+					setState(started.state, ctx);
+					return errorResult(started.error);
+				}
+				setState(started.state, ctx);
+				return textResult("评估通过。任务已标记为 RUNNING，请开始执行。完成后调用 submit_task_result(SUCCESS)。");
 			},
 		}),
 	);
@@ -400,10 +402,7 @@ function registerSpikeTool(pi: ExtensionAPI): void {
 								(nextTask ? buildNextTaskPrompt(nextTask) : ""),
 						);
 					}
-					if (nextTask && nextTask.status === "CREATED") {
-						// Need assessment
-						const pushed = pushNextToEstimate(getState()!);
-						setState(pushed, ctx);
+					if (nextTask && nextTask.status === "ESTIMATING") {
 						return textResult(
 							`✅ Spike 探索完成。已收集 ${facts.length} 条事实。\n\n` +
 								"下一个任务需要评估，请使用 assess_task。",

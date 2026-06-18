@@ -101,19 +101,24 @@ async function ingestFromText(text: string, ctx: ExtensionCommandContext): Promi
 	}
 
 	const ingested = ingestPlan(null, parsed);
-	setState(ingested, ctx);
 
-	// Push first task
-	const pushed = pushNextToEstimate(getState()!);
-	setState(pushed, ctx);
+	// Check for an init spike (READY, kind=spike) — start it directly, no assessment needed
+	const initSpike = Object.values(ingested.tasks).find((t) => t.kind === "spike" && t.spikeForTaskId === null);
 
-	ctx.ui.notify(`已摄入 ${parsed.length} 个任务。`, "info");
-
-	if (pushed.currentTaskId) {
-		const task = pushed.tasks[pushed.currentTaskId];
-		const started = startTask(getState()!, pushed.currentTaskId);
-		setState(started, ctx);
-		ctx.ui.notify(buildFirstTaskPrompt(task), "info");
+	let finalState: typeof ingested;
+	if (initSpike && initSpike.status === "READY") {
+		// Start the init spike directly
+		finalState = startTask(ingested, initSpike.id);
+		setState(finalState, ctx);
+	} else {
+		// No init spike — push first user task to ESTIMATING for assessment
+		const pushed = pushNextToEstimate(ingested);
+		if (pushed.currentTaskId) {
+			finalState = startTask(pushed, pushed.currentTaskId);
+			setState(finalState, ctx);
+		} else {
+			setState(ingested, ctx);
+		}
 	}
 
 	showStatus(ctx);
