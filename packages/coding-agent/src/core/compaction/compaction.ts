@@ -116,12 +116,21 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/**
+	 * Context-usage ratio at which compaction triggers early (before the
+	 * reserve is exhausted). Mirrors Kimi-CLI-X `should_auto_compact`:
+	 * compaction fires when `tokens >= window * triggerRatio` OR when the
+	 * reserve is exhausted. Range (0, 1]; default 0.8. Set to 1 to disable
+	 * the ratio trigger and rely solely on the reserve.
+	 */
+	triggerRatio: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	triggerRatio: 0.8,
 };
 
 // ============================================================================
@@ -212,13 +221,19 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 		lastUsageIndex: usageInfo.index,
 	};
 }
-
 /**
  * Check if compaction should trigger based on context usage.
+ * Dual trigger (mirrors Kimi-CLI-X should_auto_compact): ratio OR reserve.
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	// Dual trigger (mirrors Kimi-CLI-X should_auto_compact): fire when the
+	// context-usage ratio crosses triggerRatio, OR when the reserve is exhausted.
+	// The ratio trigger lets us compact earlier on long-running sessions, before
+	// the model starts hitting hard truncation near the window edge.
+	const ratioTriggered = settings.triggerRatio < 1 && contextTokens >= contextWindow * settings.triggerRatio;
+	const reserveTriggered = contextTokens > contextWindow - settings.reserveTokens;
+	return ratioTriggered || reserveTriggered;
 }
 
 // ============================================================================
@@ -287,6 +302,67 @@ export function estimateTokens(message: AgentMessage): number {
 	}
 
 	return 0;
+}
+/**
+ * Heuristically scale keepRecentTokens based on signals in the most recent
+ * user/assistant turn. Mirrors Kimi-CLI-X adaptive_preserve_depth: deepen on
+ * errors, thinking blocks, and multi-file edits. Returns an adjusted token
+ * budget so compaction keeps more context when signals suggest ongoing work.
+ */
+export function adaptiveKeepRecentTokens(messages: AgentMessage[], baseTokens: number): number {
+	if (messages.length === 0) return baseTokens;
+
+	// Inspect only the last user/assistant turn for speed
+	let lastTurn: AgentMessage | undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const role = messages[i].role;
+		if (role === "user" || role === "assistant") {
+			lastTurn = messages[i];
+			break;
+		}
+	}
+	if (!lastTurn) return baseTokens;
+
+	let multiplier = 1.0;
+	const text = extractTurnText(lastTurn);
+	const lowered = text.toLowerCase();
+
+	// +0.5 multiplier per signal (error/thinking/multi-file)
+	if (/\b(error|exception|failed)\b/.test(lowered)) multiplier += 0.5;
+	if (lastTurn.role === "assistant") {
+		const assistant = lastTurn as AssistantMessage;
+		if (assistant.content.some((b) => b.type === "thinking")) multiplier += 0.5;
+	}
+	// Multi-file edit heuristic: count file-path-like tokens
+	const fileRefs = lowered.match(/\b[\w-]+\.(ts|js|py|md|json|tsx|jsx)\b/g);
+	if (fileRefs && fileRefs.length > 2) multiplier += 0.5;
+
+	return Math.floor(baseTokens * multiplier);
+}
+
+function extractTurnText(message: AgentMessage): string {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content
+			.filter((c): c is { type: "text"; text: string } => c?.type === "text")
+			.map((c) => c.text)
+			.join(" ");
+	}
+	return "";
+}
+
+/**
+ * Count how many previous compaction summaries exist in the session path.
+ * Mirrors Kimi-CLI-X _detect_cascade_depth. When depth >= 3, compaction
+ * switches to a loss-minimizing prompt (see CASCADE_SUMMARIZATION_PROMPT).
+ */
+export function detectCascadeDepth(entries: SessionEntry[]): number {
+	let depth = 0;
+	for (const entry of entries) {
+		if (entry.type === "compaction") depth++;
+	}
+	return depth;
 }
 
 /**
@@ -522,6 +598,41 @@ Use this EXACT format:
 - [Preserve important context, add new if needed]
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+const CASCADE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+WARNING: This conversation has been compacted multiple times (cascade depth >= 3). Information degradation risk is HIGH. Be EXTRA careful:
+- PRESERVE every exact file path, function name, error message, and decision from the previous summary — do NOT paraphrase or generalize them.
+- Prefer keeping concrete specifics over abstract summaries.
+- If uncertain whether something is still relevant, KEEP it rather than drop it.
+
+Use this EXACT format (same as update):
+
+## Goal
+[Preserve existing goals, add new ones if the task expanded]
+
+## Constraints & Preferences
+- [Preserve existing, add new ones discovered]
+
+## Progress
+### Done
+- [x] [Include previously done items AND newly completed items]
+
+### In Progress
+- [ ] [Current work - update based on progress]
+
+### Blocked
+- [Current blockers - remove if resolved]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Next Steps
+1. [Update based on current state]
+
+## Critical Context
+- [Preserve important context, add new if needed]
+
+Keep each section concise but LOSSLESS for technical identifiers.`;
 
 function createSummarizationOptions(
 	model: Model<any>,
@@ -566,14 +677,21 @@ export async function generateSummary(
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
+	cascadeDepth?: number,
 ): Promise<string> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	// Prompt selection: cascade (>=3) + previous summary → loss-minimizing cascade prompt;
+	// otherwise update prompt when a previous summary exists, else the initial prompt.
+	let basePrompt: string;
+	if (cascadeDepth !== undefined && cascadeDepth >= 3 && previousSummary) {
+		basePrompt = CASCADE_SUMMARIZATION_PROMPT;
+	} else {
+		basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	}
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
@@ -639,6 +757,8 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+	/** Number of prior compaction summaries in the session path (cascade depth). */
+	cascadeDepth: number;
 }
 
 export function prepareCompaction(
@@ -667,24 +787,48 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const sessionMessages = buildSessionContext(pathEntries).messages;
+	const tokensBefore = estimateContextTokens(sessionMessages).tokens;
+	// B2: adaptive keep-recent budget scaled by signals in the most recent turn
+	// (errors / thinking / multi-file edits) — mirrors Kimi-CLI-X adaptive_preserve_depth.
+	const adaptiveTokens = adaptiveKeepRecentTokens(sessionMessages, settings.keepRecentTokens);
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, adaptiveTokens);
 
 	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {
 		return undefined; // Session needs migration
 	}
-	const firstKeptEntryId = firstKeptEntry.id;
+
+	// B1: first-message primacy bias (mirrors Kimi-CLI-X compaction.py prepare).
+	// When context exceeds budget, cutPoint falls past pathEntries[0]; force-keep the
+	// first message so the original task statement is never summarized away.
+	// Guard: only protect the first message when (a) cutPoint lands strictly past it,
+	// and (b) the first message is actually inside the summarize range (boundaryStart===0).
+	// If a prior compaction already covers the first message (boundaryStart>0), there's
+	// nothing new to protect at index 0 — it was already summarized in a previous round.
+	const firstEntry = pathEntries[0];
+	const firstEntryId = firstEntry?.id;
+	const preserveFirstMessage = !!firstEntryId && boundaryStart === 0 && cutPoint.firstKeptEntryIndex > 0;
+	const firstKeptEntryId = preserveFirstMessage ? firstEntryId! : firstKeptEntry.id;
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
 	// Messages to summarize (will be discarded after summary)
 	const messagesToSummarize: AgentMessage[] = [];
 	for (let i = boundaryStart; i < historyEnd; i++) {
+		// Skip the first message when it's force-kept — do not feed it to the summarizer
+		if (preserveFirstMessage && pathEntries[i].id === firstEntryId) continue;
 		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
 		if (msg) messagesToSummarize.push(msg);
+	}
+	// When first-message primacy protection consumed the entire summarize range,
+	// there's nothing left to summarize — skip this compaction rather than emit
+	// an empty summary. Only triggers under preserveFirstMessage; a normal empty
+	// range (everything fits) still produces a valid compaction marker.
+	if (preserveFirstMessage && messagesToSummarize.length === 0) {
+		return undefined;
 	}
 
 	// Messages for turn prefix summary (if splitting a turn)
@@ -706,6 +850,10 @@ export function prepareCompaction(
 		}
 	}
 
+	// B3: cascade depth — prior compaction summaries in the path. At depth >= 3
+	// the summarizer uses a loss-minimizing prompt (see generateSummary).
+	const cascadeDepth = detectCascadeDepth(pathEntries);
+
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -715,6 +863,7 @@ export function prepareCompaction(
 		previousSummary,
 		fileOps,
 		settings,
+		cascadeDepth,
 	};
 }
 
@@ -763,6 +912,7 @@ export async function compact(
 		previousSummary,
 		fileOps,
 		settings,
+		cascadeDepth,
 	} = preparation;
 
 	// Generate summaries (can be parallel if both needed) and merge into one
@@ -783,6 +933,7 @@ export async function compact(
 						previousSummary,
 						thinkingLevel,
 						streamFn,
+						cascadeDepth,
 					)
 				: Promise.resolve("No prior history."),
 			generateTurnPrefixSummary(
@@ -799,7 +950,6 @@ export async function compact(
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
 	} else {
-		// Just generate history summary
 		summary = await generateSummary(
 			messagesToSummarize,
 			model,
@@ -811,6 +961,7 @@ export async function compact(
 			previousSummary,
 			thinkingLevel,
 			streamFn,
+			cascadeDepth,
 		);
 	}
 

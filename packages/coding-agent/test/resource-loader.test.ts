@@ -216,7 +216,11 @@ export default function(pi) {
 }`,
 			);
 
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({ historyRetrieval: { enabled: false } }),
+			});
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
 					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual([
@@ -268,7 +272,11 @@ export default function(pi) {
 }`,
 			);
 
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({ historyRetrieval: { enabled: false } }),
+			});
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
@@ -406,6 +414,7 @@ Project skill content`,
 			themeData.name = "project-theme";
 			writeFileSync(join(themesDir, "project.json"), JSON.stringify(themeData, null, 2));
 			const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+			settingsManager.setHistoryRetrievalEnabled(false);
 
 			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 			await loader.reload();
@@ -659,7 +668,11 @@ export default function(pi: ExtensionAPI) {
 }`,
 			);
 
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({ historyRetrieval: { enabled: false } }),
+			});
 			await loader.reload();
 
 			const { errors } = loader.getExtensions();
@@ -713,6 +726,7 @@ export default function(pi: ExtensionAPI) {
 				cwd,
 				agentDir,
 				additionalExtensionPaths: [explicitExtPath],
+				settingsManager: SettingsManager.inMemory({ historyRetrieval: { enabled: false } }),
 			});
 			await loader.reload();
 
@@ -734,5 +748,54 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
 		});
+	});
+});
+
+describe("DefaultResourceLoader builtin history-retrieval extension", () => {
+	let tempDir: string;
+	let agentDir: string;
+	let cwd: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `rl-builtin-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		agentDir = join(tempDir, "agent");
+		cwd = join(tempDir, "project");
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("registers ContextRetrieval tool by default (historyRetrieval.enabled defaults to true)", async () => {
+		const loader = new DefaultResourceLoader({ cwd, agentDir });
+		await loader.reload();
+
+		const { extensions } = loader.getExtensions();
+		const toolNames = extensions.flatMap((e) => Array.from(e.tools.values()).map((t) => t.definition.name));
+		expect(toolNames).toContain("ContextRetrieval");
+	});
+
+	it("does NOT register ContextRetrieval when historyRetrieval.enabled is false", async () => {
+		const settingsManager = SettingsManager.inMemory({
+			historyRetrieval: { enabled: false },
+		});
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		await loader.reload();
+
+		const { extensions } = loader.getExtensions();
+		const toolNames = extensions.flatMap((e) => Array.from(e.tools.values()).map((t) => t.definition.name));
+		expect(toolNames).not.toContain("ContextRetrieval");
+	});
+
+	it("settings getter defaults to true when unset", () => {
+		const sm = SettingsManager.inMemory({});
+		expect(sm.getHistoryRetrievalEnabled()).toBe(true);
+	});
+
+	it("settings getter respects explicit false", () => {
+		const sm = SettingsManager.inMemory({ historyRetrieval: { enabled: false } });
+		expect(sm.getHistoryRetrievalEnabled()).toBe(false);
 	});
 });

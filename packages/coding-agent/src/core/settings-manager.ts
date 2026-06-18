@@ -11,11 +11,15 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	triggerRatio?: number; // default: 0.8 — context-usage ratio that triggers compaction early
 }
 
 export interface BranchSummarySettings {
 	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
+}
+export interface HistoryRetrievalSettings {
+	enabled?: boolean; // default: true — indexes messages into a BM25 engine and exposes the ContextRetrieval tool
 }
 
 export interface ProviderRetrySettings {
@@ -87,6 +91,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	historyRetrieval?: HistoryRetrievalSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
@@ -764,12 +769,38 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionTriggerRatio(): number {
+		const ratio = this.settings.compaction?.triggerRatio ?? 0.8;
+		// Clamp to (0, 1] — a value outside this range is a config error; fall back to default.
+		if (ratio <= 0 || ratio > 1) return 0.8;
+		return ratio;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		triggerRatio: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			triggerRatio: this.getCompactionTriggerRatio(),
 		};
+	}
+
+	getHistoryRetrievalEnabled(): boolean {
+		return this.settings.historyRetrieval?.enabled ?? true;
+	}
+
+	setHistoryRetrievalEnabled(enabled: boolean): void {
+		if (!this.globalSettings.historyRetrieval) {
+			this.globalSettings.historyRetrieval = {};
+		}
+		this.globalSettings.historyRetrieval.enabled = enabled;
+		this.markModified("historyRetrieval", "enabled");
+		this.save();
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {

@@ -7,6 +7,7 @@ import type { ResourceDiagnostic } from "./diagnostics.ts";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
+import { historyRetrievalExtension } from "../builtin-extensions/index.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.ts";
@@ -164,6 +165,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private additionalPromptTemplatePaths: string[];
 	private additionalThemePaths: string[];
 	private extensionFactories: ExtensionFactory[];
+	/** Built-in factories loaded unless noExtensions is set (e.g., history-retrieval). */
+	private builtinExtensionFactories: ExtensionFactory[];
 	private noExtensions: boolean;
 	private noSkills: boolean;
 	private noPromptTemplates: boolean;
@@ -222,6 +225,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
 		this.extensionFactories = options.extensionFactories ?? [];
+		this.builtinExtensionFactories = this.settingsManager.getHistoryRetrievalEnabled()
+			? [historyRetrievalExtension]
+			: [];
 		this.noExtensions = options.noExtensions ?? false;
 		this.noSkills = options.noSkills ?? false;
 		this.noPromptTemplates = options.noPromptTemplates ?? false;
@@ -881,7 +887,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const extensions: Extension[] = [];
 		const errors: Array<{ path: string; error: string }> = [];
 
-		for (const [index, factory] of this.extensionFactories.entries()) {
+		const factories = this.noExtensions
+			? this.extensionFactories
+			: [...this.extensionFactories, ...this.builtinExtensionFactories];
+		for (const [index, factory] of factories.entries()) {
 			const extensionPath = `<inline:${index + 1}>`;
 			try {
 				const extension = await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath);

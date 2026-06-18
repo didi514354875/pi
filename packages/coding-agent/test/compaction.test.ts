@@ -5,10 +5,12 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+	adaptiveKeepRecentTokens,
 	type CompactionSettings,
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	detectCascadeDepth,
 	estimateContextTokens,
 	findCutPoint,
 	getLastAssistantUsage,
@@ -225,24 +227,48 @@ describe("getLastAssistantUsage", () => {
 });
 
 describe("shouldCompact", () => {
-	it("should return true when context exceeds threshold", () => {
+	it("triggers on reserve exhaustion", () => {
+		// triggerRatio disabled (=1) → only reserve trigger active
 		const settings: CompactionSettings = {
 			enabled: true,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
+			triggerRatio: 1,
 		};
-
-		expect(shouldCompact(95000, 100000, settings)).toBe(true);
-		expect(shouldCompact(89000, 100000, settings)).toBe(false);
+		expect(shouldCompact(95000, 100000, settings)).toBe(true); // 95000 > 90000 (100000-10000)
+		expect(shouldCompact(89000, 100000, settings)).toBe(false); // below reserve threshold
 	});
 
-	it("should return false when disabled", () => {
+	it("triggers on ratio threshold (mirrors Kimi-CLI-X should_auto_compact)", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			triggerRatio: 0.8,
+		};
+		// ratio fires at 80% (80000) even though reserve (90000) isn't reached
+		expect(shouldCompact(81000, 100000, settings)).toBe(true);
+		expect(shouldCompact(79000, 100000, settings)).toBe(false);
+	});
+
+	it("fires on whichever trigger trips first (ratio fires earlier)", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 5000, // reserve threshold = 95000
+			keepRecentTokens: 20000,
+			triggerRatio: 0.8, // ratio threshold = 80000
+		};
+		// 82000 ≥ 80000 (ratio) but < 95000 (reserve) → ratio wins
+		expect(shouldCompact(82000, 100000, settings)).toBe(true);
+	});
+
+	it("returns false when disabled", () => {
 		const settings: CompactionSettings = {
 			enabled: false,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
+			triggerRatio: 0.8,
 		};
-
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
 });
@@ -547,4 +573,110 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);
 	}, 60000);
+});
+// ============================================================================
+// B1/B2/B3: Kimi-CLI-X parity behaviors
+// ============================================================================
+
+describe("B1: first-message primacy retention", () => {
+	it("force-keeps pathEntries[0] when cutPoint falls past it (budget exceeded)", () => {
+		// Build a session large enough that the keep-recent budget is exceeded
+		// and findCutPoint lands past the first message.
+		const u1 = createMessageEntry(createUserMessage("ORIGINAL TASK: do the thing ".repeat(20)));
+		const a1 = createMessageEntry(createAssistantMessage("ack ".repeat(40)));
+		const u2 = createMessageEntry(createUserMessage("second user msg ".repeat(40)));
+		const a2 = createMessageEntry(createAssistantMessage("second assistant msg ".repeat(40)));
+		const u3 = createMessageEntry(createUserMessage("third user msg ".repeat(40)));
+		const a3 = createMessageEntry(createAssistantMessage("third assistant msg ".repeat(40)));
+
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 100, // tiny budget → cutPoint falls well past pathEntries[0]
+		};
+		const preparation = prepareCompaction([u1, a1, u2, a2, u3, a3], settings);
+
+		expect(preparation).toBeDefined();
+		// First message must be force-kept even though budget wanted to drop it
+		expect(preparation!.firstKeptEntryId).toBe(u1.id);
+		// First message must NOT appear in the summarize input
+		const summarizedText = extractText(preparation!.messagesToSummarize);
+		expect(summarizedText).not.toContain("ORIGINAL TASK");
+	});
+
+	it("no-ops when first message is already in the keep window (short context)", () => {
+		// Short conversation — cutPoint stays at first message by default
+		const u1 = createMessageEntry(createUserMessage("hi"));
+		const a1 = createMessageEntry(createAssistantMessage("hello"));
+		const preparation = prepareCompaction([u1, a1], DEFAULT_COMPACTION_SETTINGS);
+
+		expect(preparation).toBeDefined();
+		expect(preparation!.firstKeptEntryId).toBe(u1.id);
+		expect(preparation!.messagesToSummarize.length).toBe(0);
+	});
+});
+
+describe("B2: adaptiveKeepRecentTokens", () => {
+	it("returns baseTokens unchanged when no signal is present", () => {
+		const msgs: AgentMessage[] = [{ role: "user", content: "plain question", timestamp: Date.now() }];
+		expect(adaptiveKeepRecentTokens(msgs, 20000)).toBe(20000);
+	});
+
+	it("scales up on error signal", () => {
+		const msgs: AgentMessage[] = [createAssistantMessage("we got an error and it failed")];
+		expect(adaptiveKeepRecentTokens(msgs, 20000)).toBeGreaterThan(20000);
+	});
+
+	it("scales up on multi-file references (>2)", () => {
+		const msgs: AgentMessage[] = [createAssistantMessage("edited auth.ts, session.ts, and config.json")];
+		expect(adaptiveKeepRecentTokens(msgs, 20000)).toBeGreaterThan(20000);
+	});
+
+	it("scales up on thinking block in assistant message", () => {
+		const msgs: AgentMessage[] = [
+			{
+				role: "assistant",
+				content: [{ type: "thinking", text: "hmm", signature: "sig" } as any, { type: "text", text: "ok" }],
+				timestamp: Date.now(),
+			} as any,
+		];
+		expect(adaptiveKeepRecentTokens(msgs, 20000)).toBeGreaterThan(20000);
+	});
+
+	it("returns baseTokens for empty input", () => {
+		expect(adaptiveKeepRecentTokens([], 20000)).toBe(20000);
+	});
+});
+
+describe("B3: detectCascadeDepth", () => {
+	it("returns 0 for a session with no compaction entries", () => {
+		const u1 = createMessageEntry(createUserMessage("hi"));
+		const a1 = createMessageEntry(createAssistantMessage("hello"));
+		expect(detectCascadeDepth([u1, a1])).toBe(0);
+	});
+
+	it("counts each compaction entry in the path", () => {
+		const u1 = createMessageEntry(createUserMessage("hi"));
+		const a1 = createMessageEntry(createAssistantMessage("hello"));
+		const c1 = createCompactionEntry("summary 1", u1.id);
+		const u2 = createMessageEntry(createUserMessage("again"));
+		const a2 = createMessageEntry(createAssistantMessage("hi"));
+		const c2 = createCompactionEntry("summary 2", u2.id);
+		const u3 = createMessageEntry(createUserMessage("again 3"));
+		const a3 = createMessageEntry(createAssistantMessage("hi"));
+		const c3 = createCompactionEntry("summary 3", u3.id);
+
+		expect(detectCascadeDepth([c1, u2, a2, c2, u3, a3, c3, u1, a1])).toBe(3);
+	});
+
+	it("prepareCompaction populates cascadeDepth on the preparation", () => {
+		const u1 = createMessageEntry(createUserMessage("hi"));
+		const a1 = createMessageEntry(createAssistantMessage("hello"));
+		const c1 = createCompactionEntry("summary 1", u1.id);
+		const u2 = createMessageEntry(createUserMessage("again"));
+		const a2 = createMessageEntry(createAssistantMessage("hi"));
+
+		const preparation = prepareCompaction([u1, a1, c1, u2, a2], DEFAULT_COMPACTION_SETTINGS);
+		expect(preparation).toBeDefined();
+		expect(preparation!.cascadeDepth).toBe(1);
+	});
 });
