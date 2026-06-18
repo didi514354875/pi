@@ -1,0 +1,192 @@
+import { describe, expect, it } from "vitest";
+import { findFactForPath, getActiveFact, invalidateFacts, makeFact, mergeFacts, toPosix } from "../src/facts.ts";
+import type { DagState, Fact } from "../src/types.ts";
+
+/** A minimal valid Fact factory for tests. */
+function fact(over: Partial<Fact> & Pick<Fact, "key" | "value">): Fact {
+	return {
+		id: over.id ?? `F_test_${Math.random().toString(16).slice(2, 8)}`,
+		key: over.key,
+		value: over.value,
+		source: over.source ?? "test",
+		confidence: over.confidence ?? 0.8,
+		evidencePaths: over.evidencePaths ?? [],
+		status: over.status ?? "VALID",
+		createdAt: over.createdAt ?? 0,
+		updatedAt: over.updatedAt ?? 0,
+	};
+}
+
+/** Create a DagState with the given facts. */
+function stateWith(facts: Fact[]): DagState {
+	return { tasks: {}, rootTaskIds: [], currentTaskId: null, totalIterations: 0, facts, adrs: [] };
+}
+
+describe("toPosix", () => {
+	it("converts backslashes to forward slashes", () => {
+		expect(toPosix("a\\b\\c.py")).toBe("a/b/c.py");
+	});
+
+	it("leaves posix paths unchanged", () => {
+		expect(toPosix("a/b/c.py")).toBe("a/b/c.py");
+	});
+
+	it("handles mixed separators", () => {
+		expect(toPosix("a\\b/c.py")).toBe("a/b/c.py");
+	});
+});
+
+describe("getActiveFact", () => {
+	it("returns VALID fact by key", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL" })]);
+		expect(getActiveFact(state, "db")?.value).toBe("MySQL");
+	});
+
+	it("returns undefined for EXPIRED fact", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL", status: "EXPIRED" })]);
+		expect(getActiveFact(state, "db")).toBeUndefined();
+	});
+
+	it("returns CONFLICT fact as fallback", () => {
+		const f = fact({ key: "db", value: "MySQL", status: "CONFLICT" });
+		const state = stateWith([f]);
+		expect(getActiveFact(state, "db")?.value).toBe("MySQL");
+	});
+
+	it("returns undefined for missing key", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL" })]);
+		expect(getActiveFact(state, "nonexistent")).toBeUndefined();
+	});
+});
+
+describe("findFactForPath", () => {
+	it("finds a fact by exact evidence path match", () => {
+		const f = fact({ key: "app", value: "main file", evidencePaths: ["app/index.ts"] });
+		const state = stateWith([f]);
+		expect(findFactForPath(state, "app/index.ts")?.value).toBe("main file");
+	});
+
+	it("finds a fact by prefix match (dir covers file)", () => {
+		const f = fact({ key: "auth", value: "auth module", evidencePaths: ["app/auth"] });
+		const state = stateWith([f]);
+		expect(findFactForPath(state, "app/auth/login.py")?.value).toBe("auth module");
+	});
+
+	it("finds a fact by key match", () => {
+		const f = fact({ key: "app/db.py", value: "database module" });
+		const state = stateWith([f]);
+		expect(findFactForPath(state, "app/db.py")?.value).toBe("database module");
+	});
+
+	it("returns undefined when path is not covered", () => {
+		const f = fact({ key: "app", value: "main", evidencePaths: ["app/auth"] });
+		const state = stateWith([f]);
+		expect(findFactForPath(state, "other/unrelated.py")).toBeUndefined();
+	});
+
+	it("rejects EXPIRED facts even if path matches", () => {
+		const f = fact({ key: "app", value: "main", evidencePaths: ["app/index.ts"], status: "EXPIRED" });
+		const state = stateWith([f]);
+		expect(findFactForPath(state, "app/index.ts")).toBeUndefined();
+	});
+
+	it("returns highest-confidence fact when multiple match", () => {
+		const f1 = fact({ key: "app", value: "low", evidencePaths: ["app/x"], confidence: 0.1 });
+		const f2 = fact({ key: "app", value: "high", evidencePaths: ["app/x"], confidence: 0.9 });
+		const state = stateWith([f1, f2]);
+		expect(findFactForPath(state, "app/x/main.ts")?.value).toBe("high");
+	});
+});
+
+describe("mergeFacts", () => {
+	it("appends a new fact", () => {
+		const state = stateWith([]);
+		const f = fact({ key: "db", value: "MySQL" });
+		const merged = mergeFacts(state, [f]);
+		expect(merged.facts).toHaveLength(1);
+		expect(merged.facts[0].value).toBe("MySQL");
+	});
+
+	it("reinforces same key same value (updates timestamp, unions evidence)", () => {
+		const f1 = fact({ key: "db", value: "MySQL", evidencePaths: ["config.ts"] });
+		const state = stateWith([f1]);
+		const f2 = fact({ key: "db", value: "MySQL", evidencePaths: ["schema.sql"] });
+		const merged = mergeFacts(state, [f2]);
+		expect(merged.facts).toHaveLength(1);
+		expect(merged.facts[0].evidencePaths).toContain("config.ts");
+		expect(merged.facts[0].evidencePaths).toContain("schema.sql");
+		expect(merged.facts[0].status).toBe("VALID");
+	});
+
+	it("marks CONFLICT for same key different value", () => {
+		const f1 = fact({ key: "db", value: "MySQL" });
+		const state = stateWith([f1]);
+		const f2 = fact({ key: "db", value: "PostgreSQL" });
+		const merged = mergeFacts(state, [f2]);
+		expect(merged.facts).toHaveLength(2);
+		const old = merged.facts.find((f) => f.value === "MySQL")!;
+		const incoming = merged.facts.find((f) => f.value === "PostgreSQL")!;
+		expect(old.status).toBe("CONFLICT");
+		expect(incoming.status).toBe("VALID");
+	});
+
+	it("does nothing with empty input", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL" })]);
+		expect(mergeFacts(state, [])).toBe(state);
+	});
+});
+
+describe("invalidateFacts", () => {
+	it("marks matching facts as EXPIRED", () => {
+		const f1 = fact({ key: "db", value: "MySQL" });
+		const f2 = fact({ key: "framework", value: "FastAPI" });
+		const state = stateWith([f1, f2]);
+		const invalidated = invalidateFacts(state, ["db"]);
+		expect(invalidated.facts.find((f) => f.key === "db")?.status).toBe("EXPIRED");
+		expect(invalidated.facts.find((f) => f.key === "framework")?.status).toBe("VALID");
+	});
+
+	it("does nothing for non-matching keys", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL" })]);
+		expect(invalidateFacts(state, ["nonexistent"])).toBe(state);
+	});
+
+	it("does nothing with empty keys", () => {
+		const state = stateWith([fact({ key: "db", value: "MySQL" })]);
+		expect(invalidateFacts(state, [])).toBe(state);
+	});
+
+	it("idempotent on already-EXPIRED facts", () => {
+		const f = fact({ key: "db", value: "MySQL", status: "EXPIRED" });
+		const state = stateWith([f]);
+		const invalidated = invalidateFacts(state, ["db"]);
+		expect(invalidated).toBe(state);
+	});
+});
+
+describe("makeFact", () => {
+	it("creates a VALID fact with id and timestamps", () => {
+		const f = makeFact({
+			key: "db",
+			value: "MySQL",
+			source: "test-spike",
+			confidence: 0.9,
+			evidencePaths: ["config.ts"],
+		});
+		expect(f.id).toMatch(/^F_/);
+		expect(f.key).toBe("db");
+		expect(f.value).toBe("MySQL");
+		expect(f.source).toBe("test-spike");
+		expect(f.confidence).toBe(0.9);
+		expect(f.evidencePaths).toEqual(["config.ts"]);
+		expect(f.status).toBe("VALID");
+		expect(f.createdAt).toBeGreaterThan(0);
+		expect(f.updatedAt).toBe(f.createdAt);
+	});
+
+	it("generates unique ids even with same input", () => {
+		const a = makeFact({ key: "x", value: "1", source: "t", confidence: 0.5, evidencePaths: [] });
+		const b = makeFact({ key: "x", value: "1", source: "t", confidence: 0.5, evidencePaths: [] });
+		expect(a.id).not.toBe(b.id);
+	});
+});

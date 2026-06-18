@@ -1,22 +1,24 @@
 import { describe, expect, it } from "vitest";
 import {
-	applyPokerScore,
+	applyAssessment,
+	completeTaskSuccess,
 	countTasks,
-	createSpikeTask,
 	decomposeTask,
+	deriveSpike,
 	finishedCount,
+	handleTaskFailure,
 	ingestPlan,
 	isDagComplete,
 	isTaskUnblocked,
 	proposeAdr,
-	pushNextToEstimate,
-	selectNextBestTask,
-	startExecution,
-	submitResult,
+	pushNextToAssess,
+	recommendNextTask,
+	startTask,
 	submitSpikeResult,
+	transitionToVerifying,
 } from "../src/engine.ts";
 import type { DagState } from "../src/types.ts";
-import { DAG_MAX_FIX_DEPTH } from "../src/types.ts";
+import { DAG_MAX_VERIFY_RETRIES } from "../src/types.ts";
 
 function makePlan(n: number) {
 	return Array.from({ length: n }, (_, i) => ({
@@ -27,23 +29,75 @@ function makePlan(n: number) {
 	}));
 }
 
+/**
+ * Calls ingestPlan with a seed fact so the day-zero init spike is skipped.
+ * Tests that don't test init-spike behavior use this to avoid the extra task.
+ */
+function seedState(planCount: number): DagState {
+	return ingestPlan(
+		{
+			tasks: {},
+			rootTaskIds: [],
+			currentTaskId: null,
+			totalIterations: 0,
+			facts: [
+				{
+					id: "F_seed",
+					key: ".",
+					value: "seed",
+					source: "INIT",
+					confidence: 0.9,
+					evidencePaths: [],
+					status: "VALID",
+					createdAt: 0,
+					updatedAt: 0,
+				},
+			],
+			adrs: [],
+		},
+		makePlan(planCount),
+	);
+}
 describe("ingestPlan", () => {
-	it("creates root tasks from a single parsed task", () => {
-		const state = ingestPlan(null, makePlan(1));
+	it("creates root tasks from a single parsed task (no init spike when facts exist)", () => {
+		const state = seedState(1);
 		expect(countTasks(state)).toBe(1);
 		expect(state.rootTaskIds).toHaveLength(1);
-		expect(state.tasks[state.rootTaskIds[0]].status).toBe("ESTIMATING");
+		expect(state.tasks[state.rootTaskIds[0]].status).toBe("CREATED");
 		expect(state.currentTaskId).toBe(state.rootTaskIds[0]);
 	});
 
-	it("creates N root tasks, first is ESTIMATING, rest TODO", () => {
-		const state = ingestPlan(null, makePlan(3));
+	it("creates N root tasks, first is current (CREATED), rest CREATED", () => {
+		const state = seedState(3);
 		expect(countTasks(state)).toBe(3);
 		const statuses = state.rootTaskIds.map((id) => state.tasks[id].status);
-		expect(statuses[0]).toBe("ESTIMATING");
-		expect(statuses[1]).toBe("TODO");
-		expect(statuses[2]).toBe("TODO");
+		expect(statuses[0]).toBe("CREATED");
+		expect(statuses[1]).toBe("CREATED");
+		expect(statuses[2]).toBe("CREATED");
 		expect(state.currentTaskId).toBe(state.rootTaskIds[0]);
+	});
+
+	it("injects a day-zero init spike when facts are empty", () => {
+		const state = ingestPlan(null, makePlan(2));
+		expect(countTasks(state)).toBe(3); // 1 spike + 2 business
+		// spike is first in rootTaskIds, business tasks follow
+		const spikeTask = state.tasks[state.rootTaskIds[0]];
+		expect(spikeTask.kind).toBe("spike");
+		expect(spikeTask.status).toBe("RUNNING"); // started via selectNextToDrive
+		// Business tasks are CREATED and blocked by spike
+		const biz1 = state.tasks[state.rootTaskIds[1]];
+		const biz2 = state.tasks[state.rootTaskIds[2]];
+		expect(biz1.status).toBe("CREATED");
+		expect(biz2.status).toBe("CREATED");
+		expect(biz1.dependsOn).toContain(spikeTask.id);
+		expect(biz2.dependsOn).toContain(spikeTask.id);
+		expect(state.currentTaskId).toBe(spikeTask.id);
+	});
+
+	it("skips init spike when facts already exist", () => {
+		const state = seedState(2);
+		expect(countTasks(state)).toBe(2);
+		expect(state.tasks[state.rootTaskIds[0]].kind).toBe("standard");
 	});
 
 	it("resolves dependsOn keys to generated ids", () => {
@@ -53,65 +107,96 @@ describe("ingestPlan", () => {
 		];
 		const state = ingestPlan(null, plan);
 		const taskB = state.tasks[state.rootTaskIds[1]];
-		expect(taskB.dependsOn).toEqual([state.rootTaskIds[0]]);
+		expect(taskB.dependsOn).toContain(state.rootTaskIds[0]);
 	});
 });
 
-describe("pushNextToEstimate", () => {
+describe("pushNextToAssess", () => {
 	it("does nothing when currentTaskId is already set", () => {
-		const state = ingestPlan(null, makePlan(2));
+		const state = seedState(2);
 		const before = state.currentTaskId;
-		const after = pushNextToEstimate(state);
+		const after = pushNextToAssess(state);
 		expect(after.currentTaskId).toBe(before);
 	});
 
-	it("pushes next unblocked TODO task", () => {
-		const state = ingestPlan(null, makePlan(2));
-		// Manually clear currentTaskId to simulate a submit that left a gap.
+	it("pushes next unblocked CREATED task", () => {
+		const state = seedState(2);
 		const cleared: DagState = { ...state, currentTaskId: null };
-		const pushed = pushNextToEstimate(cleared);
+		const pushed = pushNextToAssess(cleared);
 		expect(pushed.currentTaskId).toBeTruthy();
 	});
 });
 
-describe("applyPokerScore", () => {
-	it("scores < threshold → action ready, task READY", () => {
-		const state = ingestPlan(null, makePlan(1));
+describe("applyAssessment", () => {
+	it("low complexity → action ready, task READY", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: newState, action } = applyPokerScore(state, taskId, 5);
+		const { state: newState, action } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
 		expect(action).toBe("ready");
 		expect(newState.tasks[taskId].status).toBe("READY");
-		expect(newState.tasks[taskId].storyPoints).toBe(5);
+		expect(newState.tasks[taskId].complexity).toBe(3);
+		expect(newState.tasks[taskId].risk).toBe(3);
+		expect(newState.tasks[taskId].confidence).toBe(8);
 	});
 
-	it("scores >= threshold → action decompose, stays ESTIMATING", () => {
-		const state = ingestPlan(null, makePlan(1));
+	it("complexity > threshold → action decompose, stays CREATED", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: newState, action } = applyPokerScore(state, taskId, 8);
+		const { state: newState, action } = applyAssessment(state, taskId, {
+			complexity: 9,
+			risk: 5,
+			confidence: 5,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
 		expect(action).toBe("decompose");
-		expect(newState.tasks[taskId].status).toBe("ESTIMATING");
+		expect(newState.tasks[taskId].status).toBe("CREATED");
 	});
 
-	it("scores 13 → action decompose", () => {
-		const state = ingestPlan(null, makePlan(1));
+	it("complexity == threshold (8) → action ready (boundary is strictly-greater)", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { action } = applyPokerScore(state, taskId, 13);
-		expect(action).toBe("decompose");
+		const { action } = applyAssessment(state, taskId, {
+			complexity: 8,
+			risk: 5,
+			confidence: 5,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		expect(action).toBe("ready");
 	});
 
-	it("scores -1 (Spike) → action spike, task stays ESTIMATING", () => {
-		const state = ingestPlan(null, makePlan(1));
+	it("isSpike=true → action spike, task stays CREATED", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: newState, action } = applyPokerScore(state, taskId, -1);
+		const { state: newState, action } = applyAssessment(state, taskId, {
+			complexity: 10,
+			risk: 10,
+			confidence: 1,
+			isSpike: true,
+			proposedTargetFiles: [],
+		});
 		expect(action).toBe("spike");
-		// applyPokerScore only records the score; createSpikeTask mutates structure.
-		expect(newState.tasks[taskId].status).toBe("ESTIMATING");
-		expect(newState.tasks[taskId].storyPoints).toBe(-1);
+		// applyAssessment records values only; deriveSpike mutates structure.
+		expect(newState.tasks[taskId].status).toBe("CREATED");
+		expect(newState.tasks[taskId].complexity).toBe(10);
 	});
 
 	it("returns action ready for non-existent task", () => {
-		const state = ingestPlan(null, makePlan(1));
-		const { state: newState, action } = applyPokerScore(state, "T_nope", 3);
+		const state = seedState(1);
+		const { state: newState, action } = applyAssessment(state, "T_nope", {
+			complexity: 3,
+			risk: 3,
+			confidence: 3,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
 		expect(action).toBe("ready");
 		expect(newState).toBe(state);
 	});
@@ -119,7 +204,7 @@ describe("applyPokerScore", () => {
 
 describe("decomposeTask", () => {
 	it("sequential children are chained, parent BLOCKED", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const parentId = state.currentTaskId!;
 		const children = [
 			{ title: "Sub A", description: "a" },
@@ -132,13 +217,13 @@ describe("decomposeTask", () => {
 
 		const childTasks = Object.values(newState.tasks).filter((t) => t.parentId === parentId);
 		expect(childTasks).toHaveLength(3);
+		// Children start as CREATED.
+		expect(childTasks.every((c) => c.status === "CREATED")).toBe(true);
 
-		// Sequential: child[1] depends on child[0], child[2] depends on child[1]
 		const sorted = childTasks.sort((a, b) => a.title.localeCompare(b.title));
 		expect(sorted[1].dependsOn).toContain(sorted[0].id);
 		expect(sorted[2].dependsOn).toContain(sorted[1].id);
 
-		// First child should be ESTIMATING (it's unblocked since it has no done-deps)
 		expect(newState.currentTaskId).toBeTruthy();
 		expect(newState.tasks[newState.currentTaskId!].parentId).toBe(parentId);
 	});
@@ -150,8 +235,13 @@ describe("decomposeTask", () => {
 		];
 		let state = ingestPlan(null, plan);
 		const parentId = state.currentTaskId!;
-		// Score the root so it's not estimating, then decompose
-		const { state: scored } = applyPokerScore(state, parentId, 13);
+		const { state: scored } = applyAssessment(state, parentId, {
+			complexity: 9,
+			risk: 5,
+			confidence: 5,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
 		state = scored;
 
 		const children = [
@@ -161,66 +251,87 @@ describe("decomposeTask", () => {
 		const newState = decomposeTask(state, parentId, children, false);
 
 		const childTasks = Object.values(newState.tasks).filter((t) => t.parentId === parentId);
-		// Parallel children should not depend on each other
 		expect(childTasks[0].dependsOn).not.toContain(childTasks[1].id);
 		expect(childTasks[1].dependsOn).not.toContain(childTasks[0].id);
 	});
 
 	it("does nothing with empty children array", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const newState = decomposeTask(state, state.currentTaskId!, [], true);
 		expect(newState).toBe(state);
 	});
-	it("can decompose an IN_PROGRESS task mid-execution", () => {
-		const state = ingestPlan(null, makePlan(1));
-		const taskId = state.currentTaskId!;
-		// Score low so it becomes READY, then start execution
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		expect(executing.tasks[taskId].status).toBe("IN_PROGRESS");
 
-		// Now decompose mid-execution
+	it("can decompose a RUNNING task mid-execution", () => {
+		const state = seedState(1);
+		const taskId = state.currentTaskId!;
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskId);
+		expect(executing.tasks[taskId].status).toBe("RUNNING");
+
 		const children = [
 			{ title: "Part A", description: "a" },
 			{ title: "Part B", description: "b" },
 		];
 		const newState = decomposeTask(executing, taskId, children, true);
 
-		// Parent should be BLOCKED, first child should be ESTIMATING
 		expect(newState.tasks[taskId].status).toBe("BLOCKED");
 		expect(newState.currentTaskId).toBeTruthy();
 		expect(newState.tasks[newState.currentTaskId!].parentId).toBe(taskId);
 	});
 });
 
-describe("startExecution", () => {
-	it("transitions READY → IN_PROGRESS and increments iteration", () => {
-		const state = ingestPlan(null, makePlan(1));
+describe("startTask", () => {
+	it("transitions READY → RUNNING and increments iteration", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const newState = startExecution(scored, taskId);
-		expect(newState.tasks[taskId].status).toBe("IN_PROGRESS");
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const newState = startTask(scored, taskId);
+		expect(newState.tasks[taskId].status).toBe("RUNNING");
 		expect(newState.tasks[taskId].iteration).toBe(1);
 		expect(newState.currentTaskId).toBe(taskId);
 		expect(newState.totalIterations).toBe(1);
 	});
 
 	it("does nothing for non-READY task", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const newState = startExecution(state, taskId);
+		const newState = startTask(state, taskId);
 		expect(newState).toBe(state);
 	});
 });
 
-describe("submitResult", () => {
-	it("marks task DONE and sets resultSummary", () => {
-		const state = ingestPlan(null, makePlan(1));
+describe("transitionToVerifying + completeTaskSuccess", () => {
+	it("SUCCESS → VERIFYING → DONE and sets resultSummary", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { state: newState, isComplete } = submitResult(executing, taskId, "SUCCESS", "done", false);
-
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskId);
+		// Pre-set the summary (as the tools layer does before transitioning).
+		const withSummary: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [taskId]: { ...executing.tasks[taskId], resultSummary: "done" } },
+		};
+		const verifying = transitionToVerifying(withSummary, taskId);
+		expect(verifying.tasks[taskId].status).toBe("VERIFYING");
+		const { state: newState, isComplete } = completeTaskSuccess(verifying, taskId);
 		expect(newState.tasks[taskId].status).toBe("DONE");
 		expect(newState.tasks[taskId].resultSummary).toBe("done");
 		expect(isComplete).toBe(true);
@@ -233,49 +344,35 @@ describe("submitResult", () => {
 		];
 		const state = ingestPlan(null, plan);
 		const taskAId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskAId, 3);
-		const executing = startExecution(scored, taskAId);
-		const { state: newState } = submitResult(executing, taskAId, "SUCCESS", "A completed", false);
+		const { state: scored } = applyAssessment(state, taskAId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskAId);
+		const withSummary: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [taskAId]: { ...executing.tasks[taskAId], resultSummary: "A completed" } },
+		};
+		const verifying = transitionToVerifying(withSummary, taskAId);
+		const { state: newState } = completeTaskSuccess(verifying, taskAId);
 
 		const taskB = newState.tasks[newState.rootTaskIds[1]];
 		expect(taskB.context).toContain("A completed");
 	});
 
-	it("FAILED (fixDepth < cap) → BLOCKED + bugfix derivation, not terminal", () => {
-		const state = ingestPlan(null, makePlan(1));
-		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { state: newState, nextTaskId, isComplete } = submitResult(executing, taskId, "FAILED", "broke", false);
-		// Failed task is frozen (BLOCKED), not terminal FAILED.
-		expect(newState.tasks[taskId].status).toBe("BLOCKED");
-		// A bugfix child is derived and driven next.
-		const bugfix = nextTaskId ? newState.tasks[nextTaskId] : undefined;
-		expect(bugfix).toBeDefined();
-		expect(bugfix!.kind).toBe("bugfix");
-		expect(bugfix!.fixDepth).toBe(1);
-		expect(newState.tasks[taskId].dependsOn).toContain(bugfix!.id);
-		expect(isComplete).toBe(false);
-	});
-
-	it("needNewTasks=true → nextTaskId null, not complete", () => {
-		const plan = [
-			{ title: "A", description: "a", dependsOn: [], key: "T0" },
-			{ title: "B", description: "b", dependsOn: [], key: "T1" },
-		];
-		const state = ingestPlan(null, plan);
-		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { nextTaskId, isComplete } = submitResult(executing, taskId, "SUCCESS", "done", true);
-		expect(nextTaskId).toBeNull();
-		expect(isComplete).toBe(false);
-	});
-
 	it("auto-completes BLOCKED parent when all children done", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const parentId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, parentId, 13);
+		const { state: scored } = applyAssessment(state, parentId, {
+			complexity: 9,
+			risk: 5,
+			confidence: 5,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
 		const decomposed = decomposeTask(
 			scored,
 			parentId,
@@ -286,17 +383,37 @@ describe("submitResult", () => {
 			true,
 		);
 
-		// Complete first child
+		// Complete first child.
 		const child1Id = decomposed.currentTaskId!;
-		const { state: s1 } = applyPokerScore(decomposed, child1Id, 3);
-		const s2 = startExecution(s1, child1Id);
-		const { state: s3 } = submitResult(s2, child1Id, "SUCCESS", "c1 done", false);
+		const s1 = applyAssessment(decomposed, child1Id, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		}).state;
+		const s2 = startTask(s1, child1Id);
+		const s2s: DagState = {
+			...s2,
+			tasks: { ...s2.tasks, [child1Id]: { ...s2.tasks[child1Id], resultSummary: "c1 done" } },
+		};
+		const s3 = completeTaskSuccess(transitionToVerifying(s2s, child1Id), child1Id).state;
 
-		// Complete second child
+		// Complete second child.
 		const child2Id = s3.currentTaskId!;
-		const { state: s4 } = applyPokerScore(s3, child2Id, 3);
-		const s5 = startExecution(s4, child2Id);
-		const { state: s6, isComplete } = submitResult(s5, child2Id, "SUCCESS", "c2 done", false);
+		const s4 = applyAssessment(s3, child2Id, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		}).state;
+		const s5 = startTask(s4, child2Id);
+		const s5s: DagState = {
+			...s5,
+			tasks: { ...s5.tasks, [child2Id]: { ...s5.tasks[child2Id], resultSummary: "c2 done" } },
+		};
+		const { state: s6, isComplete } = completeTaskSuccess(transitionToVerifying(s5s, child2Id), child2Id);
 
 		expect(isComplete).toBe(true);
 		expect(s6.tasks[parentId].status).toBe("DONE");
@@ -305,58 +422,165 @@ describe("submitResult", () => {
 	});
 });
 
-describe("selectNextBestTask", () => {
-	it("picks READY task with most dependents", () => {
-		// A is depended on by B and C; D is standalone. A should win.
+describe("handleTaskFailure retry", () => {
+	it("retryCount < cap → task re-queued for retry with failure context", () => {
+		const state = seedState(1);
+		const taskId = state.currentTaskId!;
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskId);
+		const verifying = transitionToVerifying(executing, taskId);
+		const { state: newState, nextTaskId } = handleTaskFailure(verifying, taskId, "verify failed");
+		const failed = newState.tasks[taskId];
+		// Non-terminal failure: task is re-queued for a direct retry (auto-started
+		// to RUNNING) with the failure context appended.
+		expect(failed.retryCount).toBe(1);
+		expect(failed.context).toContain("[verify-fail #1]");
+		expect(failed.context).toContain("verify failed");
+		expect(nextTaskId).toBe(taskId);
+		expect(failed.status).toBe("RUNNING");
+	});
+
+	it("retryCount >= cap → terminal FAILED + cascade to dependents", () => {
 		const plan = [
 			{ title: "A", description: "a", dependsOn: [], key: "T0" },
 			{ title: "B", description: "b", dependsOn: ["T0"], key: "T1" },
-			{ title: "C", description: "c", dependsOn: ["T0"], key: "T2" },
-			{ title: "D", description: "d", dependsOn: [], key: "T3" },
 		];
-		let state = ingestPlan(null, plan);
-		// Score all tasks to READY first (need to advance through them)
-		const ids = [...state.rootTaskIds];
-		// Score the current one, then manually make others READY
-		for (const id of ids) {
-			const task = state.tasks[id];
-			if (task.status === "ESTIMATING" || task.status === "TODO") {
-				const { state: scored } = applyPokerScore(state, id, 3);
-				state = scored;
-			}
+		const state = ingestPlan(null, plan);
+		const aId = state.currentTaskId!;
+		const bId = Object.keys(state.tasks).find((id) => id !== aId)!;
+		const { state: scored } = applyAssessment(state, aId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, aId);
+		// Pre-set retryCount to cap-1 so one more failure hits the cap.
+		const atCap: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [aId]: { ...executing.tasks[aId], retryCount: DAG_MAX_VERIFY_RETRIES - 1 } },
+		};
+		const verifying = transitionToVerifying(atCap, aId);
+		const { state: newState, isComplete } = handleTaskFailure(verifying, aId, "fatal");
+		expect(newState.tasks[aId].status).toBe("FAILED");
+		expect(newState.tasks[aId].retryCount).toBe(DAG_MAX_VERIFY_RETRIES);
+		expect(newState.tasks[bId].status).toBe("FAILED");
+		expect(isComplete).toBe(true);
+	});
+});
+
+describe("recommendNextTask heuristic formula", () => {
+	it("spike task beats high-downstream task (W_SPIKE=100 dominates)", () => {
+		// Two READY tasks: a spike (downstream=0) and a standard (downstream=5).
+		// spike:  15*0 + 100 - 5*5 + 2*5 = 85
+		// std:    15*5 + 0   - 5*5 + 2*5 = 60
+		const plan = [
+			{ title: "Spike", description: "s", dependsOn: [], key: "T0" },
+			{ title: "Std", description: "x", dependsOn: [], key: "T1" },
+			{ title: "D1", description: "d", dependsOn: ["T1"], key: "T2" },
+			{ title: "D2", description: "d", dependsOn: ["T1"], key: "T3" },
+			{ title: "D3", description: "d", dependsOn: ["T1"], key: "T4" },
+			{ title: "D4", description: "d", dependsOn: ["T1"], key: "T5" },
+			{ title: "D5", description: "d", dependsOn: ["T1"], key: "T6" },
+		];
+		const state = ingestPlan(null, plan);
+		const spikeId = state.rootTaskIds[0];
+		const stdId = state.rootTaskIds[1];
+		// Force both candidates to READY. The spike uses isSpike=true but
+		// applyAssessment leaves a spike candidate CREATED (deriveSpike is what
+		// promotes it to READY), so set status directly to model the READY spike.
+		let s = state;
+		for (const id of [spikeId, stdId]) {
+			s = applyAssessment(s, id, {
+				complexity: 5,
+				risk: 5,
+				confidence: 5,
+				isSpike: id === spikeId,
+				proposedTargetFiles: [],
+			}).state;
 		}
-		// A should have 2 dependents, D has 0
-		const best = selectNextBestTask(state);
-		expect(best).toBe(state.rootTaskIds[0]);
+		s = {
+			...s,
+			tasks: {
+				...s.tasks,
+				[spikeId]: { ...s.tasks[spikeId], kind: "spike", status: "READY" },
+				[stdId]: { ...s.tasks[stdId], status: "READY" },
+			},
+			currentTaskId: null,
+		};
+		expect(recommendNextTask(s)).toBe(spikeId);
+	});
+
+	it("higher downstream wins when no spike", () => {
+		// A(downstream=3,complexity=3) vs B(downstream=1,complexity=1)
+		// A: 15*3 - 5*3 + 2*8 = 51
+		// B: 15*1 - 5*1 + 2*8 = 26
+		const plan = [
+			{ title: "A", description: "a", dependsOn: [], key: "T0" },
+			{ title: "B", description: "b", dependsOn: [], key: "T1" },
+			{ title: "A1", description: "x", dependsOn: ["T0"], key: "T2" },
+			{ title: "A2", description: "x", dependsOn: ["T0"], key: "T3" },
+			{ title: "A3", description: "x", dependsOn: ["T0"], key: "T4" },
+			{ title: "B1", description: "x", dependsOn: ["T1"], key: "T5" },
+		];
+		const state = ingestPlan(null, plan);
+		const aId = state.rootTaskIds[0];
+		const bId = state.rootTaskIds[1];
+		let s = state;
+		for (const id of [aId, bId]) {
+			s = applyAssessment(s, id, {
+				complexity: id === aId ? 3 : 1,
+				risk: 2,
+				confidence: 8,
+				isSpike: false,
+				proposedTargetFiles: [],
+			}).state;
+		}
+		s = { ...s, currentTaskId: null };
+		expect(recommendNextTask(s)).toBe(aId);
+	});
+
+	it("lower complexity wins on downstream tie", () => {
+		// Two downstream=0 tasks: complexity 2 vs 8.
+		// lo:  0 - 5*2 + 2*8 = 6
+		// hi:  0 - 5*8 + 2*8 = -24
+		const plan = [
+			{ title: "Lo", description: "l", dependsOn: [], key: "T0" },
+			{ title: "Hi", description: "h", dependsOn: [], key: "T1" },
+		];
+		const state = ingestPlan(null, plan);
+		const loId = state.rootTaskIds[0];
+		const hiId = state.rootTaskIds[1];
+		let s = state;
+		for (const id of [loId, hiId]) {
+			s = applyAssessment(s, id, {
+				complexity: id === loId ? 2 : 8,
+				risk: 2,
+				confidence: 8,
+				isSpike: false,
+				proposedTargetFiles: [],
+			}).state;
+		}
+		s = { ...s, currentTaskId: null };
+		expect(recommendNextTask(s)).toBe(loId);
 	});
 
 	it("returns null when no READY tasks", () => {
-		const state = ingestPlan(null, makePlan(1));
-		expect(selectNextBestTask(state)).toBeNull();
-	});
-
-	it("tie-break is stable (insertion order)", () => {
-		// Two standalone READY tasks with same points — first inserted wins.
-		const plan = [
-			{ title: "X", description: "x", dependsOn: [], key: "T0" },
-			{ title: "Y", description: "y", dependsOn: [], key: "T1" },
-		];
-		let state = ingestPlan(null, plan);
-		for (const id of [...state.rootTaskIds]) {
-			const task = state.tasks[id];
-			if (task.status === "ESTIMATING" || task.status === "TODO") {
-				const { state: scored } = applyPokerScore(state, id, 3);
-				state = scored;
-			}
-		}
-		const best = selectNextBestTask(state);
-		expect(best).toBe(state.rootTaskIds[0]);
+		const state = seedState(1);
+		expect(recommendNextTask(state)).toBeNull();
 	});
 });
 
 describe("isTaskUnblocked", () => {
 	it("returns true for task with no dependencies", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		expect(isTaskUnblocked(state, state.rootTaskIds[0])).toBe(true);
 	});
 
@@ -376,183 +600,185 @@ describe("isTaskUnblocked", () => {
 		];
 		const state = ingestPlan(null, plan);
 		const taskAId = state.rootTaskIds[0];
-		const { state: scored } = applyPokerScore(state, taskAId, 3);
-		const executing = startExecution(scored, taskAId);
-		const { state: done } = submitResult(executing, taskAId, "SUCCESS", "ok", false);
+		const { state: scored } = applyAssessment(state, taskAId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskAId);
+		const withSummary: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [taskAId]: { ...executing.tasks[taskAId], resultSummary: "ok" } },
+		};
+		const { state: done } = completeTaskSuccess(transitionToVerifying(withSummary, taskAId), taskAId);
 		expect(isTaskUnblocked(done, done.rootTaskIds[1])).toBe(true);
 	});
 });
 
 describe("isDagComplete", () => {
 	it("returns false when tasks remain active", () => {
-		const state = ingestPlan(null, makePlan(2));
+		const state = seedState(2);
 		expect(isDagComplete(state)).toBe(false);
 	});
 
 	it("returns true when all tasks DONE/FAILED", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { state: done } = submitResult(executing, taskId, "SUCCESS", "ok", false);
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskId);
+		const withSummary: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [taskId]: { ...executing.tasks[taskId], resultSummary: "ok" } },
+		};
+		const { state: done } = completeTaskSuccess(transitionToVerifying(withSummary, taskId), taskId);
 		expect(isDagComplete(done)).toBe(true);
 	});
 });
 
 describe("finishedCount", () => {
 	it("counts DONE and FAILED tasks", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		expect(finishedCount(state)).toBe(0);
 		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { state: done } = submitResult(executing, taskId, "SUCCESS", "ok", false);
+		const { state: scored } = applyAssessment(state, taskId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, taskId);
+		const withSummary: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [taskId]: { ...executing.tasks[taskId], resultSummary: "ok" } },
+		};
+		const { state: done } = completeTaskSuccess(transitionToVerifying(withSummary, taskId), taskId);
 		expect(finishedCount(done)).toBe(1);
 	});
 });
 
-describe("createSpikeTask", () => {
-	it("freezes the original BLOCKED, derives a Spike IN_PROGRESS, wires dep", () => {
-		const state = ingestPlan(null, makePlan(1));
+describe("deriveSpike", () => {
+	it("freezes the original BLOCKED, derives a Spike READY, wires dep", () => {
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const spiked = createSpikeTask(state, taskId);
+		const spiked = deriveSpike(state, taskId);
 
-		// Original is frozen.
 		expect(spiked.tasks[taskId].status).toBe("BLOCKED");
-		// Spike is current and already IN_PROGRESS (skips Agile Poker — it's a probe).
-		expect(spiked.currentTaskId).toBeTruthy();
-		expect(spiked.currentTaskId).not.toBe(taskId);
-		const spike = spiked.tasks[spiked.currentTaskId!];
-		expect(spike.kind).toBe("spike");
-		expect(spike.status).toBe("IN_PROGRESS");
+		const spike = Object.values(spiked.tasks).find((t) => t.kind === "spike")!;
+		expect(spike).toBeDefined();
+		expect(spike.status).toBe("READY");
 		expect(spike.spikeForTaskId).toBe(taskId);
-		// Original now depends on the Spike.
+		expect(spike.complexity).toBe(5);
 		expect(spiked.tasks[taskId].dependsOn).toContain(spike.id);
 	});
 
 	it("is a no-op for a non-existent task", () => {
-		const state = ingestPlan(null, makePlan(1));
-		expect(createSpikeTask(state, "T_nope")).toBe(state);
+		const state = seedState(1);
+		expect(deriveSpike(state, "T_nope")).toBe(state);
 	});
 });
 
 describe("submitSpikeResult", () => {
 	it("merges facts into the blackboard and unblocks the original task", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const spiked = createSpikeTask(state, taskId);
-		const spikeId = spiked.currentTaskId!;
-		// Spike is already IN_PROGRESS (createSpikeTask skips Agile Poker).
+		const spiked = deriveSpike(state, taskId);
+		const spikeId = Object.values(spiked.tasks).find((t) => t.kind === "spike")!.id;
+		// Start the spike so it's RUNNING before submit.
+		const spikeStarted = startTask(spiked, spikeId);
 
-		const { state: after, nextTaskId } = submitSpikeResult(spiked, spikeId, { DB: "MySQL", framework: "FastAPI" });
-		// Spike closed.
+		const { state: after, nextTaskId } = submitSpikeResult(spikeStarted, spikeId, [
+			{ key: "DB", value: "MySQL" },
+			{ key: "framework", value: "FastAPI" },
+		]);
 		expect(after.tasks[spikeId].status).toBe("DONE");
-		// Facts merged into global blackboard.
-		expect(after.facts.DB).toBe("MySQL");
-		expect(after.facts.framework).toBe("FastAPI");
-		// Original task released back to ESTIMATING.
+		expect(after.facts.find((f) => f.key === "DB")?.value).toBe("MySQL");
+		expect(after.facts.find((f) => f.key === "framework")?.value).toBe("FastAPI");
+		// Original task released back to CREATED (awaiting re-assessment).
 		expect(nextTaskId).toBe(taskId);
-		expect(after.tasks[taskId].status).toBe("ESTIMATING");
-		// Fact summary propagated into the original task's context.
+		expect(after.tasks[taskId].status).toBe("CREATED");
 		expect(after.tasks[taskId].context).toContain("MySQL");
 	});
 
 	it("rejects a non-spike task id", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		const taskId = state.currentTaskId!;
-		const { state: after, nextTaskId } = submitSpikeResult(state, taskId, { x: "y" });
+		const { state: after, nextTaskId } = submitSpikeResult(state, taskId, [{ key: "x", value: "y" }]);
 		expect(nextTaskId).toBeNull();
 		expect(after).toBe(state);
 	});
 });
 
-describe("submitResult fail-fix depth cap", () => {
-	it("FAILED at fixDepth >= cap → terminal FAILED, no bugfix derived", () => {
-		// Hand-build a state where the current task is already at max fix depth.
-		const state = ingestPlan(null, makePlan(1));
-		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const capped: DagState = {
-			...executing,
-			tasks: { ...executing.tasks, [taskId]: { ...executing.tasks[taskId], fixDepth: DAG_MAX_FIX_DEPTH } },
-		};
-		const { state: newState, nextTaskId } = submitResult(capped, taskId, "FAILED", "broke again", false);
-		expect(newState.tasks[taskId].status).toBe("FAILED");
-		expect(nextTaskId).toBeNull();
-		// No bugfix child created.
-		const bugfixChildren = Object.values(newState.tasks).filter((t) => t.kind === "bugfix");
-		expect(bugfixChildren).toHaveLength(0);
-	});
-
-	it("bugfix completion unblocks the failed task back to ESTIMATING", () => {
-		const state = ingestPlan(null, makePlan(1));
-		const taskId = state.currentTaskId!;
-		const { state: scored } = applyPokerScore(state, taskId, 3);
-		const executing = startExecution(scored, taskId);
-		const { state: failed, nextTaskId: bugfixId } = submitResult(executing, taskId, "FAILED", "broke", false);
-		expect(bugfixId).toBeTruthy();
-		// Score + execute the bugfix, then submit SUCCESS.
-		const bugScored = applyPokerScore(failed, bugfixId!, 3).state;
-		const bugExec = startExecution(bugScored, bugfixId!);
-		const { state: after, nextTaskId } = submitResult(bugExec, bugfixId!, "SUCCESS", "fixed", false);
-		// Bugfix DONE; original task is no longer BLOCKED — it re-enters ESTIMATING.
-		expect(after.tasks[bugfixId!].status).toBe("DONE");
-		expect(after.tasks[taskId].status).toBe("ESTIMATING");
-		expect(nextTaskId).toBe(taskId);
-	});
-});
-
 describe("proposeAdr", () => {
 	it("appends an ADR entry to the global blackboard", () => {
-		const state = ingestPlan(null, makePlan(1));
+		const state = seedState(1);
 		expect(state.adrs).toHaveLength(0);
 		const withAdr = proposeAdr(state, "统一鉴权", "使用 JWT");
 		expect(withAdr.adrs).toHaveLength(1);
 		expect(withAdr.adrs[0].title).toBe("统一鉴权");
 		expect(withAdr.adrs[0].decision).toBe("使用 JWT");
 		expect(withAdr.adrs[0].id).toMatch(/^ADR_/);
-		// Does not mutate the original state.
 		expect(state.adrs).toHaveLength(0);
 	});
 });
 
-describe("cascadeTerminalFailure (Bug A)", () => {
-	it("B depends on A, A terminally FAILED → B also FAILED", () => {
+describe("cascadeTerminalFailure", () => {
+	it("terminal FAILED → dependent also FAILED", () => {
 		const state = ingestPlan(null, [
 			{ title: "A", description: "a", dependsOn: [], key: "KA" },
 			{ title: "B", description: "b", dependsOn: ["KA"], key: "KB" },
 		]);
 		const aId = state.currentTaskId!;
 		const bId = Object.keys(state.tasks).find((id) => id !== aId)!;
-		// Force A to max fix depth so FAILED is terminal.
-		const capped = { ...state, tasks: { ...state.tasks, [aId]: { ...state.tasks[aId], fixDepth: 2 } } };
-		const scored = applyPokerScore(capped, aId, 3).state;
-		const executing = startExecution(scored, aId);
-		const result = submitResult(executing, aId, "FAILED", "unrecoverable", false);
+		// Pre-set retryCount so the failure is terminal.
+		const { state: scored } = applyAssessment(state, aId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, aId);
+		const atCap: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [aId]: { ...executing.tasks[aId], retryCount: DAG_MAX_VERIFY_RETRIES - 1 } },
+		};
+		const result = handleTaskFailure(transitionToVerifying(atCap, aId), aId, "unrecoverable");
 		expect(result.state.tasks[aId].status).toBe("FAILED");
 		expect(result.state.tasks[bId].status).toBe("FAILED");
 		expect(result.isComplete).toBe(true);
 	});
 
-	it("A fail-fix eligible (fixDepth < cap) → A BLOCKED, bugfix derived, no cascade to B", () => {
+	it("non-terminal failure → task re-queued RUNNING for retry, no cascade to dependents", () => {
 		const state = ingestPlan(null, [
 			{ title: "A", description: "a", dependsOn: [], key: "KA" },
 			{ title: "B", description: "b", dependsOn: ["KA"], key: "KB" },
 		]);
 		const aId = state.currentTaskId!;
 		const bId = Object.keys(state.tasks).find((id) => id !== aId)!;
-		const scored = applyPokerScore(state, aId, 3).state;
-		const executing = startExecution(scored, aId);
-		const result = submitResult(executing, aId, "FAILED", "fixable", false);
-		expect(result.state.tasks[aId].status).toBe("BLOCKED");
+		const { state: scored } = applyAssessment(state, aId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, aId);
+		const result = handleTaskFailure(transitionToVerifying(executing, aId), aId, "fixable");
+		expect(result.state.tasks[aId].status).toBe("RUNNING");
+		expect(result.state.tasks[aId].retryCount).toBe(1);
 		expect(result.state.tasks[bId].status).not.toBe("FAILED");
-		expect(result.nextTaskId).not.toBeNull();
-		const bugfix = result.state.tasks[result.nextTaskId!];
-		expect(bugfix.kind).toBe("bugfix");
 	});
 
-	it("transitive cascade: A FAILED → B (depends on A) → C (depends on B) all FAILED", () => {
+	it("transitive cascade: A FAILED → B → C all FAILED", () => {
 		const state = ingestPlan(null, [
 			{ title: "A", description: "a", dependsOn: [], key: "KA" },
 			{ title: "B", description: "b", dependsOn: ["KA"], key: "KB" },
@@ -564,10 +790,19 @@ describe("cascadeTerminalFailure (Bug A)", () => {
 			(id) => id !== aId && state.tasks[id].dependsOn.length === 1 && state.tasks[id].dependsOn[0] === aId,
 		)!;
 		const cId = ids.find((id) => id !== aId && id !== bId)!;
-		const capped = { ...state, tasks: { ...state.tasks, [aId]: { ...state.tasks[aId], fixDepth: 2 } } };
-		const scored = applyPokerScore(capped, aId, 3).state;
-		const executing = startExecution(scored, aId);
-		const result = submitResult(executing, aId, "FAILED", "fatal", false);
+		const { state: scored } = applyAssessment(state, aId, {
+			complexity: 3,
+			risk: 3,
+			confidence: 8,
+			isSpike: false,
+			proposedTargetFiles: [],
+		});
+		const executing = startTask(scored, aId);
+		const atCap: DagState = {
+			...executing,
+			tasks: { ...executing.tasks, [aId]: { ...executing.tasks[aId], retryCount: DAG_MAX_VERIFY_RETRIES - 1 } },
+		};
+		const result = handleTaskFailure(transitionToVerifying(atCap, aId), aId, "fatal");
 		expect(result.state.tasks[aId].status).toBe("FAILED");
 		expect(result.state.tasks[bId].status).toBe("FAILED");
 		expect(result.state.tasks[cId].status).toBe("FAILED");

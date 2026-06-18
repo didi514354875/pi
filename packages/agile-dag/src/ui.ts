@@ -6,17 +6,8 @@
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { countTasks, finishedCount } from "./engine.ts";
-import type { DagState, TaskNode, TaskStatus } from "./types.ts";
-
-const STATUS_ICON: Record<TaskStatus, string> = {
-	TODO: "□",
-	ESTIMATING: "►",
-	READY: "○",
-	BLOCKED: "◂",
-	IN_PROGRESS: "►",
-	DONE: "✓",
-	FAILED: "✕",
-};
+import type { DagState, TaskNode } from "./types.ts";
+import { STATUS_ICON } from "./types.ts";
 
 const COMPLETION_DISPLAY_MS = 8000;
 

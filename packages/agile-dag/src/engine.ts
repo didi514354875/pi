@@ -1,21 +1,27 @@
 /**
- * Pure DAG state-machine functions.
+ * Pure DAG state-machine functions (v3.1).
  *
- * No Pi API dependency — fully testable in isolation. Every function returns a
- * new DagState (immutable update) or a result tuple; none mutate the input.
+ * All functions here are pure: no I/O, no side effects. Git commit/reset and
+ * verification-pipeline execution live in the tools layer (git.ts / verify.ts),
+ * which calls these transitions before/after the side-effecting work.
  */
 import { randomUUID } from "node:crypto";
+import { invalidateFacts, makeFact, mergeFacts } from "./facts.ts";
 import type { ParsedTask } from "./parser.ts";
 import {
 	type AdrEntry,
-	DAG_MAX_FIX_DEPTH,
-	DAG_POKER_THRESHOLD,
+	DAG_COMPLEXITY_THRESHOLD,
+	DAG_MAX_VERIFY_RETRIES,
 	type DagState,
+	type Fact,
 	isTaskActive,
-	type StoryPoints,
 	type TaskKind,
 	type TaskNode,
 	type TaskStatus,
+	W_COMPLEXITY,
+	W_CONFIDENCE,
+	W_CRITICAL,
+	W_SPIKE,
 } from "./types.ts";
 
 /** Context cap (chars) appended to a successor when a predecessor completes. */
@@ -32,7 +38,7 @@ function generateTaskId(tasks: Record<string, TaskNode>): string {
 	return `T_${randomUUID()}`;
 }
 
-/** Count how many tasks depend on `taskId`. */
+/** Count how many tasks directly depend on `taskId`. */
 function countDependents(state: DagState, taskId: string): number {
 	let count = 0;
 	for (const task of Object.values(state.tasks)) {
@@ -40,12 +46,38 @@ function countDependents(state: DagState, taskId: string): number {
 	}
 	return count;
 }
+/** Build a fresh task node with v3.2 defaults. */
+function makeTask(over: Partial<TaskNode> & Pick<TaskNode, "id" | "title" | "description">): TaskNode {
+	return {
+		status: "CREATED",
+		complexity: 0,
+		risk: 0,
+		confidence: 0,
+		dependsOn: [],
+		parentId: null,
+		context: "",
+		resultSummary: null,
+		iteration: 0,
+		kind: "standard",
+		boundary: "",
+		spikeForTaskId: null,
+		retryCount: 0,
+		proposedTargetFiles: [],
+		...over,
+	};
+}
 
 /**
  * Create root tasks from parsed plan input.
  *
- * Resolves sibling `key` references in each ParsedTask.dependsOn to generated
- * task ids, then pushes the first unblocked TODO task to ESTIMATING.
+ * If the knowledge graph is empty (a fresh session, not a restore), a day-zero
+ * initialization Spike is inserted as a prerequisite of every business root
+ * task. It harvests the project skeleton into facts so subsequent assessments
+ * can satisfy the Proof-of-Knowledge gate. Restored sessions with existing
+ * facts skip this.
+ *
+ * Root tasks start as CREATED; the first unblocked one is pushed as current
+ * (awaiting assess_task).
  */
 export function ingestPlan(state: DagState | null, plan: ParsedTask[]): DagState {
 	const base = normalizeState(state);
@@ -53,24 +85,17 @@ export function ingestPlan(state: DagState | null, plan: ParsedTask[]): DagState
 	const keyToId = new Map<string, string>();
 	const created: { id: string; dependsOnKeys: string[] }[] = [];
 
+	// Day-zero probe: only when the knowledge graph is empty.
+	const initSpikeId = base.facts.length === 0 ? createInitSpike(tasks) : null;
+
 	for (const parsed of plan) {
 		const id = generateTaskId(tasks);
-		tasks[id] = {
+		tasks[id] = makeTask({
 			id,
 			title: parsed.title,
 			description: parsed.description,
-			status: "TODO",
-			storyPoints: null,
 			dependsOn: [],
-			parentId: null,
-			context: "",
-			resultSummary: null,
-			iteration: 0,
-			kind: "standard",
-			boundary: "",
-			spikeForTaskId: null,
-			fixDepth: 0,
-		};
+		});
 		keyToId.set(parsed.key, id);
 		created.push({ id, dependsOnKeys: parsed.dependsOn });
 	}
@@ -81,10 +106,12 @@ export function ingestPlan(state: DagState | null, plan: ParsedTask[]): DagState
 			const depId = keyToId.get(key);
 			if (depId && depId !== id) resolved.push(depId);
 		}
+		// Every business root task waits on the day-zero spike (if any).
+		if (initSpikeId) resolved.push(initSpikeId);
 		tasks[id] = { ...tasks[id], dependsOn: resolved };
 	}
 
-	const rootTaskIds = [...base.rootTaskIds, ...created.map((c) => c.id)];
+	const rootTaskIds = [...base.rootTaskIds, ...(initSpikeId ? [initSpikeId] : []), ...created.map((c) => c.id)];
 	const newState: DagState = {
 		tasks,
 		rootTaskIds,
@@ -93,13 +120,48 @@ export function ingestPlan(state: DagState | null, plan: ParsedTask[]): DagState
 		facts: base.facts,
 		adrs: base.adrs,
 	};
-	return pushNextToEstimate(newState);
+	// If a day-zero spike was created it is already READY; start it immediately
+	// via selectNextToDrive so the agent begins exploring. Otherwise push the
+	// first CREATED task for assessment.
+	if (initSpikeId) {
+		const { state: driven } = selectNextToDrive(newState);
+		return driven;
+	}
+	return pushNextToAssess(newState);
 }
 
 /**
- * Ensure a (possibly older) DagState carries the blackboard fields.
- * Restored sessions pre-dating facts/adrs get empty defaults; tasks missing
- * the new discriminator fields are backfilled so downstream code can rely on them.
+ * Build the day-zero initialization Spike — a READY read-only probe that
+ * harvests the project skeleton (root files, README, dependency manifests)
+ * into the knowledge graph. Mutates `tasks` in place and returns the new id.
+ */
+function createInitSpike(tasks: Record<string, TaskNode>): string {
+	const id = generateTaskId(tasks);
+	tasks[id] = makeTask({
+		id,
+		title: "项目初始化探针",
+		description:
+			"只读调研项目骨架：根目录结构、README、依赖文件（package.json / requirements.txt / go.mod 等）、技术栈与核心目录。完成后调用 submit_spike_result，把每个核心目录或文件作为 fact（key=路径，value=简述），并用 evidence_paths 标注证据路径。禁止 edit/write。",
+		status: "READY",
+		complexity: 3,
+		risk: 1,
+		confidence: 9,
+		kind: "spike",
+		boundary: "",
+		spikeForTaskId: null,
+	});
+	return id;
+}
+
+/**
+ * Ensure a restored DagState carries every v3.2 field. Sessions persisted
+ * before the v3.2 rewrite (tasks missing `proposedTargetFiles`, or facts in
+ * the v3.1 `Record<string,string>` form) cannot always be migrated losslessly:
+ *  - Tasks missing `proposedTargetFiles` → backfilled to `[]`.
+ *  - Pre-v3.1 tasks (storyPoints without complexity) → already rejected by
+ *    persist.isLegacyFormat, so we only backfill optional fields here.
+ *  - Facts are validated as Fact[] by persist; here we only backfill missing
+ *    optional sub-fields (evidencePaths/status/confidence) defensively.
  */
 export function normalizeState(state: DagState | null): DagState {
 	if (!state) return emptyBlackboardlessState();
@@ -109,46 +171,70 @@ export function normalizeState(state: DagState | null): DagState {
 			task.kind === undefined ||
 			task.boundary === undefined ||
 			task.spikeForTaskId === undefined ||
-			task.fixDepth === undefined
+			task.retryCount === undefined ||
+			task.complexity === undefined ||
+			task.risk === undefined ||
+			task.confidence === undefined ||
+			task.proposedTargetFiles === undefined
 		) {
 			tasks[id] = {
 				...task,
 				kind: task.kind ?? "standard",
 				boundary: task.boundary ?? "",
 				spikeForTaskId: task.spikeForTaskId ?? null,
-				fixDepth: task.fixDepth ?? 0,
+				retryCount: (task as TaskNode & { retryCount?: number }).retryCount ?? 0,
+				complexity: (task as TaskNode & { complexity?: number }).complexity ?? 0,
+				risk: (task as TaskNode & { risk?: number }).risk ?? 0,
+				confidence: (task as TaskNode & { confidence?: number }).confidence ?? 0,
+				proposedTargetFiles: (task as TaskNode & { proposedTargetFiles?: string[] }).proposedTargetFiles ?? [],
 			};
 		}
+	}
+	// Defensive facts backfill: persist.isLegacyFormat already rejects malformed
+	// shapes, but a partially-persisted Fact may miss optional fields.
+	const rawFacts = state.facts as unknown;
+	let facts: Fact[];
+	if (!Array.isArray(rawFacts)) {
+		facts = [];
+	} else {
+		facts = (rawFacts as Array<Partial<Fact>>).map((f) => ({
+			id: f.id ?? `F_recovered_${Math.random().toString(16).slice(2, 8)}`,
+			key: f.key ?? "",
+			value: f.value ?? "",
+			source: f.source ?? "INIT",
+			confidence: f.confidence ?? 0.9,
+			evidencePaths: f.evidencePaths ?? [],
+			status: f.status ?? "VALID",
+			createdAt: f.createdAt ?? 0,
+			updatedAt: f.updatedAt ?? 0,
+		}));
 	}
 	return {
 		tasks,
 		rootTaskIds: state.rootTaskIds,
 		currentTaskId: state.currentTaskId,
 		totalIterations: state.totalIterations,
-		facts: state.facts ?? {},
+		facts,
 		adrs: state.adrs ?? [],
 	};
 }
 
 function emptyBlackboardlessState(): DagState {
-	return { tasks: {}, rootTaskIds: [], currentTaskId: null, totalIterations: 0, facts: {}, adrs: [] };
+	return { tasks: {}, rootTaskIds: [], currentTaskId: null, totalIterations: 0, facts: [], adrs: [] };
 }
 
 /**
- * Mark the best unblocked TODO task ESTIMATING and set currentTaskId.
+ * Mark the best unblocked CREATED task as current (awaiting assess_task).
  *
  * First releases any BLOCKED tasks whose only blockers were dependency edges
- * (e.g. a Spike or Bug Fix prerequisite that has since completed) back to TODO,
- * so they re-enter the estimation queue. BLOCKED tasks that are still waiting
- * on their own decomposition children stay BLOCKED.
+ * (e.g. a Spike prerequisite that has since completed) back to CREATED.
  */
-export function pushNextToEstimate(state: DagState): DagState {
+export function pushNextToAssess(state: DagState): DagState {
 	const working = releaseDependencyBlockedTasks(state);
 	if (working.currentTaskId) return working;
 	for (const task of Object.values(working.tasks)) {
-		if (task.status === "TODO" && isTaskUnblocked(working, task.id)) {
-			const tasks = { ...working.tasks, [task.id]: { ...task, status: "ESTIMATING" as const } };
-			return { ...working, tasks, currentTaskId: task.id };
+		if (task.status === "CREATED" && isTaskUnblocked(working, task.id)) {
+			return { ...working, currentTaskId: task.id };
 		}
 	}
 	return working;
@@ -156,8 +242,8 @@ export function pushNextToEstimate(state: DagState): DagState {
 
 /**
  * Move BLOCKED tasks whose children are all settled AND whose dependency edges
- * are all DONE back to TODO, so they can be re-estimated. A task waiting on its
- * own in-progress decomposition children is left BLOCKED.
+ * are all DONE back to CREATED, so they re-enter the assessment queue. A task
+ * waiting on its own in-progress decomposition children stays BLOCKED.
  */
 function releaseDependencyBlockedTasks(state: DagState): DagState {
 	let tasks = state.tasks;
@@ -167,76 +253,96 @@ function releaseDependencyBlockedTasks(state: DagState): DagState {
 		for (const task of Object.values(tasks)) {
 			if (task.status !== "BLOCKED") continue;
 			const children = Object.values(tasks).filter((t) => t.parentId === task.id);
-			// If it has active children, it's blocked by decomposition — leave it.
 			if (children.some((c) => c.status !== "DONE" && c.status !== "FAILED")) continue;
 			if (!isTaskUnblocked({ ...state, tasks }, task.id)) continue;
-			tasks = { ...tasks, [task.id]: { ...task, status: "TODO" as const } };
+			tasks = { ...tasks, [task.id]: { ...task, status: "CREATED" as const } };
 			changed = true;
 		}
 	}
 	return tasks === state.tasks ? state : { ...state, tasks };
 }
 
+/** Assessment payload supplied by assess_task. */
+export interface Assessment {
+	complexity: number;
+	risk: number;
+	confidence: number;
+	isSpike: boolean;
+	/**
+	 * Files this task intends to modify (spikes and decompositions may leave
+	 * this empty). Used by the Proof-of-Knowledge gate and the runtime boundary
+	 * block.
+	 */
+	proposedTargetFiles: string[];
+}
+
 /**
- * Record a poker score and decide the next action.
+ * Record an assessment and decide the next action.
  *
- * Returns an `action` the caller (tools layer) must branch on:
- *  - "ready":     points below threshold — task moved to READY; caller starts execution.
- *  - "decompose": points at/above threshold — task stays ESTIMATING; caller demands decomposition.
- *  - "spike":     the -1 probe card — caller must call createSpikeTask to freeze & derive a probe.
- *
- * applyPokerScore itself does NOT create the Spike task (kept side-effect free
- * wrt task creation); it only records the score. The tool layer owns the branch.
+ *  - "spike":     isSpike — caller derives a read-only probe via deriveSpike.
+ *  - "decompose": complexity > threshold — caller demands decomposition.
+ *  - "ready":     otherwise — task moved to READY; the proposedTargetFiles are
+ *                 recorded and their comma-joined path becomes the `boundary`
+ *                 glob (Step 5 runtime barrier).
  */
-export function applyPokerScore(
+export function applyAssessment(
 	state: DagState,
 	taskId: string,
-	points: StoryPoints,
+	assessment: Assessment,
 ): { state: DagState; action: "ready" | "decompose" | "spike" } {
 	const task = state.tasks[taskId];
 	if (!task) return { state, action: "ready" };
 
-	const updated: TaskNode = { ...task, storyPoints: points };
-	if (points === -1) {
+	const updated: TaskNode = {
+		...task,
+		complexity: assessment.complexity,
+		risk: assessment.risk,
+		confidence: assessment.confidence,
+		proposedTargetFiles: assessment.proposedTargetFiles,
+	};
+	if (assessment.isSpike) {
 		const tasks = { ...state.tasks, [taskId]: updated };
 		return { state: { ...state, tasks }, action: "spike" };
 	}
-	if (points >= DAG_POKER_THRESHOLD) {
+	if (assessment.complexity > DAG_COMPLEXITY_THRESHOLD) {
 		const tasks = { ...state.tasks, [taskId]: updated };
 		return { state: { ...state, tasks }, action: "decompose" };
 	}
-	const tasks = { ...state.tasks, [taskId]: { ...updated, status: "READY" as const } };
+	// "ready" — write proposedTargetFiles as the runtime boundary.
+	const boundary = assessment.proposedTargetFiles.join(",");
+	const tasks = {
+		...state.tasks,
+		[taskId]: { ...updated, status: "READY" as const, boundary },
+	};
 	return { state: { ...state, tasks }, action: "ready" };
 }
 
 /**
  * Freeze `taskId` (the black-box original) and derive a read-only Spike probe
  * as its new prerequisite. The original task is BLOCKED and depends on the
- * Spike. The Spike is pushed straight to IN_PROGRESS and becomes current:
- * a Spike is a probe, not an estimatable unit — it skips Agile Poker and the
- * Worker begins read-only exploration immediately.
+ * Spike. The Spike starts as READY — recommendNextTask selects it next via the
+ * W_SPIKE bonus, then startTask transitions it to RUNNING.
  */
-export function createSpikeTask(state: DagState, taskId: string): DagState {
+export function deriveSpike(state: DagState, taskId: string): DagState {
 	const task = state.tasks[taskId];
 	if (!task) return state;
 
 	const spikeId = generateTaskId(state.tasks);
-	const spike: TaskNode = {
+	const spike: TaskNode = makeTask({
 		id: spikeId,
 		title: `Spike: ${task.title}`,
 		description: `探针任务：探索并萃取与「${task.title}」相关的客观事实（只读模式，禁止修改任何文件）。完成后调用 submit_spike_result 输出 Key-Value 事实。`,
-		status: "IN_PROGRESS" as const,
-		storyPoints: null,
+		status: "READY",
 		dependsOn: [...task.dependsOn],
 		parentId: task.parentId,
 		context: task.context,
-		resultSummary: null,
-		iteration: 1,
+		complexity: 5,
+		risk: 5,
+		confidence: 5,
 		kind: "spike",
 		boundary: "",
 		spikeForTaskId: taskId,
-		fixDepth: 0,
-	};
+	});
 
 	const tasks: Record<string, TaskNode> = {
 		...state.tasks,
@@ -248,7 +354,7 @@ export function createSpikeTask(state: DagState, taskId: string): DagState {
 		},
 	};
 
-	return { ...state, tasks, currentTaskId: spikeId, totalIterations: state.totalIterations + 1 };
+	return { ...state, tasks, currentTaskId: null };
 }
 
 /**
@@ -256,7 +362,7 @@ export function createSpikeTask(state: DagState, taskId: string): DagState {
  *
  * Sequential: child[i] depends on child[i-1] (child[0] inherits parent deps).
  * Parallel: every child inherits the parent's dependsOn.
- * The first child is pushed to ESTIMATING.
+ * Children start as CREATED; the first is pushed as current (awaiting assess).
  */
 export function decomposeTask(
 	state: DagState,
@@ -278,48 +384,53 @@ export function decomposeTask(
 		const dependsOn = isSequential && childIds.length > 0 ? [childIds[childIds.length - 1]] : [...parent.dependsOn];
 		tasks = {
 			...tasks,
-			[id]: {
+			[id]: makeTask({
 				id,
 				title: child.title,
 				description: child.description,
-				status: "TODO",
-				storyPoints: null,
 				dependsOn,
 				parentId,
 				context: parent.context,
-				resultSummary: null,
-				iteration: 0,
 				kind: child.kind ?? "standard",
 				boundary: child.boundary ?? "",
-				spikeForTaskId: null,
-				fixDepth: 0,
-			},
+			}),
 		};
 		childIds.push(id);
 	}
 
-	return pushNextToEstimate({ ...state, tasks, currentTaskId: null });
+	return pushNextToAssess({ ...state, tasks, currentTaskId: null });
+}
+
+/** Input shape for submit_spike_result facts. */
+export interface SpikeFactInput {
+	key: string;
+	value: string;
+	confidence?: number;
+	evidencePaths?: string[];
 }
 
 /**
- * Close a Spike task, merge its Key-Value facts into the global blackboard,
- * and release the frozen original task back to ESTIMATING for re-estimation.
+ * Close a Spike task, merge its facts into the global knowledge graph, and
+ * release the frozen original task back to CREATED for re-assessment.
  *
- * Returns the original task id (the one the Spike was probing) so the caller
- * can drive it next. The agent must now re-score it in light of the new facts.
+ * Day-zero spikes (spikeForTaskId === null) only merge facts — they have no
+ * original task to unlock.
+ *
+ * Spikes are read-only probes with no code output: they skip verification and
+ * Git commit.
  */
 export function submitSpikeResult(
 	state: DagState,
 	spikeId: string,
-	facts: Record<string, string>,
+	facts: SpikeFactInput[],
 ): { state: DagState; nextTaskId: string | null; isComplete: boolean } {
 	const spike = state.tasks[spikeId];
 	if (!spike || spike.kind !== "spike") {
 		return { state, nextTaskId: null, isComplete: isDagComplete(state) };
 	}
 
-	const summary = Object.entries(facts)
-		.map(([k, v]) => `${k}=${v}`)
+	const summary = facts
+		.map((f) => `${f.key}=${f.value}`)
 		.join("; ")
 		.slice(0, RESULT_CONTEXT_CAP);
 
@@ -328,11 +439,22 @@ export function submitSpikeResult(
 		[spikeId]: { ...spike, status: "DONE" as const, resultSummary: summary },
 	};
 
-	// Merge facts into the global blackboard (last-write-wins).
-	const mergedFacts: Record<string, string> = { ...state.facts };
-	for (const [k, v] of Object.entries(facts)) mergedFacts[k] = v;
+	// Convert inputs to Fact[] and merge.
+	const newFacts = facts.map((f) =>
+		makeFact(
+			{
+				key: f.key,
+				value: f.value,
+				source: spikeId,
+				confidence: f.confidence ?? 0.8,
+				evidencePaths: f.evidencePaths ?? [],
+			},
+			state.facts,
+		),
+	);
+	let nextState: DagState = mergeFacts(state, newFacts);
+	nextState = { ...nextState, tasks, currentTaskId: null };
 
-	// Propagate the fact summary to the probed task's context.
 	const probedId = spike.spikeForTaskId;
 	if (probedId && tasks[probedId]) {
 		const addition = `\n[spike:${spike.title}]: ${summary}`.slice(0, RESULT_CONTEXT_CAP);
@@ -343,30 +465,42 @@ export function submitSpikeResult(
 				context: (tasks[probedId].context + addition).slice(0, CONTEXT_CAP),
 			},
 		};
+		nextState = { ...nextState, tasks };
 	}
 
-	let nextState: DagState = { ...state, tasks, currentTaskId: null, facts: mergedFacts };
 	nextState = resolveCompletedParents(nextState);
 
-	const complete = isDagComplete(nextState);
-	if (complete) {
+	if (isDagComplete(nextState)) {
 		return { state: nextState, nextTaskId: null, isComplete: true };
 	}
 
-	// Push the next TODO (the unblocked probed task, if any) to ESTIMATING.
-	const estimating = pushNextToEstimate(nextState);
-	return { state: estimating, nextTaskId: estimating.currentTaskId, isComplete: false };
+	const assessing = pushNextToAssess(nextState);
+	return { state: assessing, nextTaskId: assessing.currentTaskId, isComplete: false };
 }
 
-/** Transition a READY task to IN_PROGRESS and set it as current. */
-export function startExecution(state: DagState, taskId: string): DagState {
+/** Transition a READY task to RUNNING and set it as current. */
+export function startTask(state: DagState, taskId: string): DagState {
 	const task = state.tasks[taskId];
 	if (!task || task.status !== "READY") return state;
 	const tasks = {
 		...state.tasks,
-		[taskId]: { ...task, status: "IN_PROGRESS" as const, iteration: task.iteration + 1 },
+		[taskId]: { ...task, status: "RUNNING" as const, iteration: task.iteration + 1 },
 	};
 	return { ...state, tasks, currentTaskId: taskId, totalIterations: state.totalIterations + 1 };
+}
+
+/**
+ * Transition a RUNNING task to VERIFYING (engine runs the verify pipeline next).
+ * Does not change currentTaskId — the verify result drives the next transition.
+ */
+export function transitionToVerifying(state: DagState, taskId: string): DagState {
+	const task = state.tasks[taskId];
+	if (!task || task.status !== "RUNNING") return state;
+	const tasks = {
+		...state.tasks,
+		[taskId]: { ...task, status: "VERIFYING" as const },
+	};
+	return { ...state, tasks };
 }
 
 /** A task is READY-eligible once every dependsOn entry is DONE. */
@@ -380,18 +514,28 @@ export function isTaskUnblocked(state: DagState, taskId: string): boolean {
 	return true;
 }
 
-/** Highest-scored READY + unblocked task (dependents*2 − points*0.5); stable tie-break by insertion order. */
-export function selectNextBestTask(state: DagState): string | null {
+/**
+ * Highest-scored READY + unblocked task per the v3.1 heuristic formula:
+ *   score = W_CRITICAL * downstream + W_SPIKE * isSpike
+ *           − W_COMPLEXITY * complexity + W_CONFIDENCE * confidence
+ *
+ * Spike probes dominate (W_SPIKE=100). Stable tie-break by insertion order.
+ */
+export function recommendNextTask(state: DagState): string | null {
 	let bestId: string | null = null;
-	let bestScore = 0;
+	let bestScore = -Infinity;
 	for (const task of Object.values(state.tasks)) {
 		if (task.status !== "READY" || !isTaskUnblocked(state, task.id)) continue;
-		const dependents = countDependents(state, task.id);
-		const points = task.storyPoints ?? 0;
-		const score = dependents * 2 - points * 0.5;
-		if (bestId === null || score > bestScore) {
-			bestId = task.id;
+		const downstream = countDependents(state, task.id);
+		const spikeBonus = task.kind === "spike" ? 1 : 0;
+		const score =
+			W_CRITICAL * downstream +
+			W_SPIKE * spikeBonus -
+			W_COMPLEXITY * task.complexity +
+			W_CONFIDENCE * task.confidence;
+		if (score > bestScore) {
 			bestScore = score;
+			bestId = task.id;
 		}
 	}
 	return bestId;
@@ -421,7 +565,10 @@ function resolveCompletedParents(state: DagState): DagState {
 				const addition = `\n[${task.title}]: ${aggregated}`.slice(0, RESULT_CONTEXT_CAP);
 				tasks = {
 					...tasks,
-					[dependent.id]: { ...dependent, context: (dependent.context + addition).slice(0, CONTEXT_CAP) },
+					[dependent.id]: {
+						...dependent,
+						context: (dependent.context + addition).slice(0, CONTEXT_CAP),
+					},
 				};
 			}
 		}
@@ -429,7 +576,7 @@ function resolveCompletedParents(state: DagState): DagState {
 	return { ...state, tasks };
 }
 
-/** No TODO/ESTIMATING/READY/IN_PROGRESS/BLOCKED tasks remain. */
+/** No CREATED/READY/RUNNING/VERIFYING/BLOCKED tasks remain. */
 export function isDagComplete(state: DagState): boolean {
 	for (const task of Object.values(state.tasks)) {
 		if (isTaskActive(task.status)) return false;
@@ -457,33 +604,38 @@ export function finishedCount(state: DagState): number {
 }
 
 /**
- * Submit a result: mark DONE/FAILED, propagate context to direct successors,
- * resolve completed parents, then select the next task to drive.
- *
- * Returns the next task id (an ESTIMATING or IN_PROGRESS task) and whether the
- * whole DAG is complete. When `needNewTasks` is true the system does not
- * auto-advance: nextTaskId is null and the agent is asked to clarify/decompose.
+ * Select the next task to drive after a state transition:
+ * prefer a READY task (recommendNextTask), else push the next CREATED task.
  */
-export function submitResult(
+function selectNextToDrive(state: DagState): { state: DagState; nextTaskId: string | null } {
+	const readyId = recommendNextTask(state);
+	if (readyId !== null) {
+		return { state: startTask(state, readyId), nextTaskId: readyId };
+	}
+	const assessing = pushNextToAssess(state);
+	return { state: assessing, nextTaskId: assessing.currentTaskId };
+}
+
+/**
+ * VERIFYING → DONE (caller has already committed via Git).
+ *
+ * Marks the task DONE, resolves completed parents, and selects the next task.
+ */
+export function completeTaskSuccess(
 	state: DagState,
 	taskId: string,
-	status: "SUCCESS" | "FAILED",
-	resultSummary: string,
-	needNewTasks: boolean,
+	invalidateFactKeys?: string[],
 ): { state: DagState; nextTaskId: string | null; isComplete: boolean } {
 	const task = state.tasks[taskId];
 	if (!task) return { state, nextTaskId: null, isComplete: isDagComplete(state) };
 
-	const isFailure = status === "FAILED";
-	const summary = resultSummary.slice(0, RESULT_CONTEXT_CAP);
-	// FAILED under the fix-depth cap triggers the Micro Fail-Fix Loop:
-	// instead of a terminal FAILED, freeze the task and derive a Bug Fix
-	// prerequisite so a clean-context Worker can repair it.
-	const failFixEligible = isFailure && task.fixDepth < DAG_MAX_FIX_DEPTH;
-	const newStatus: TaskStatus = isFailure ? (failFixEligible ? "BLOCKED" : "FAILED") : "DONE";
+	// Expire stated facts before marking DONE so downstream tasks see the latest truth.
+	const expired = invalidateFacts(state, invalidateFactKeys ?? []);
+
+	const summary = (task.resultSummary ?? "").slice(0, RESULT_CONTEXT_CAP);
 	let tasks: Record<string, TaskNode> = {
 		...state.tasks,
-		[taskId]: { ...task, status: newStatus, resultSummary: summary },
+		[taskId]: { ...task, status: "DONE" as const, resultSummary: summary },
 	};
 
 	for (const dependent of Object.values(tasks)) {
@@ -491,68 +643,78 @@ export function submitResult(
 		const addition = `\n[${task.title}]: ${summary}`.slice(0, RESULT_CONTEXT_CAP);
 		tasks = {
 			...tasks,
-			[dependent.id]: { ...dependent, context: (dependent.context + addition).slice(0, CONTEXT_CAP) },
+			[dependent.id]: {
+				...dependent,
+				context: (dependent.context + addition).slice(0, CONTEXT_CAP),
+			},
 		};
 	}
 
-	// Cascade terminal FAILURE to dependents that can never unblock.
-	if (newStatus === "FAILED") {
-		const cascaded = cascadeTerminalFailure({ ...state, tasks }, taskId);
-		tasks = cascaded.tasks;
+	let nextState: DagState = { ...expired, tasks, currentTaskId: null };
+	nextState = resolveCompletedParents(nextState);
+
+	if (isDagComplete(nextState)) {
+		return { state: nextState, nextTaskId: null, isComplete: true };
 	}
+
+	const { state: driven, nextTaskId } = selectNextToDrive(nextState);
+	return { state: driven, nextTaskId, isComplete: false };
+}
+
+/**
+ * VERIFYING or RUNNING failure (verify pipeline failed, or agent self-reported
+ * FAILED). Caller has already run `git reset --hard` + `git clean -fd`.
+ *
+ * Under the retry cap the task returns to READY for a clean retry (the failure
+ * reason is appended to its context as `[verify-fail #N]: ...`). At/above the
+ * cap the task is terminal FAILED and the failure cascades to dependents.
+ */
+export function handleTaskFailure(
+	state: DagState,
+	taskId: string,
+	reason: string,
+): { state: DagState; nextTaskId: string | null; isComplete: boolean } {
+	const task = state.tasks[taskId];
+	if (!task) return { state, nextTaskId: null, isComplete: isDagComplete(state) };
+
+	const newRetryCount = task.retryCount + 1;
+	const terminal = newRetryCount >= DAG_MAX_VERIFY_RETRIES;
+	const summary = reason.slice(0, RESULT_CONTEXT_CAP);
+
+	if (!terminal) {
+		const failNote = `\n[verify-fail #${newRetryCount}]: ${summary}`.slice(0, RESULT_CONTEXT_CAP);
+		const tasks: Record<string, TaskNode> = {
+			...state.tasks,
+			[taskId]: {
+				...task,
+				status: "READY" as const,
+				resultSummary: null,
+				retryCount: newRetryCount,
+				context: (task.context + failNote).slice(0, CONTEXT_CAP),
+			},
+		};
+		const nextState: DagState = { ...state, tasks, currentTaskId: null };
+		const { state: driven, nextTaskId } = selectNextToDrive(nextState);
+		return { state: driven, nextTaskId, isComplete: false };
+	}
+
+	let tasks: Record<string, TaskNode> = {
+		...state.tasks,
+		[taskId]: { ...task, status: "FAILED" as const, resultSummary: summary, retryCount: newRetryCount },
+	};
+
+	const cascaded = cascadeTerminalFailure({ ...state, tasks }, taskId);
+	tasks = cascaded.tasks;
 
 	let nextState: DagState = { ...state, tasks, currentTaskId: null };
 	nextState = resolveCompletedParents(nextState);
 
-	const complete = isDagComplete(nextState);
-	if (complete) {
+	if (isDagComplete(nextState)) {
 		return { state: nextState, nextTaskId: null, isComplete: true };
 	}
 
-	if (failFixEligible) {
-		// Derive a Bug Fix task in a fresh, clean context. It blocks the failed
-		// task so the latter re-runs only after the fix lands.
-		const bugfixId = generateTaskId(nextState.tasks);
-		const bugfix: TaskNode = {
-			id: bugfixId,
-			title: `Bug Fix: ${task.title}`,
-			description: `修复失败任务的错误。错误摘要：${summary}`,
-			status: "TODO",
-			storyPoints: null,
-			dependsOn: [],
-			parentId: task.parentId,
-			context: "",
-			resultSummary: null,
-			iteration: 0,
-			kind: "bugfix",
-			boundary: task.boundary,
-			spikeForTaskId: null,
-			fixDepth: task.fixDepth + 1,
-		};
-		const failedTask = nextState.tasks[taskId];
-		const fixTasks: Record<string, TaskNode> = {
-			...nextState.tasks,
-			[bugfixId]: bugfix,
-			[taskId]: { ...failedTask, dependsOn: [...failedTask.dependsOn, bugfixId] },
-		};
-		const fixState: DagState = { ...nextState, tasks: fixTasks };
-		const estimating = pushNextToEstimate(fixState);
-		return { state: estimating, nextTaskId: bugfixId, isComplete: false };
-	}
-
-	if (needNewTasks) {
-		return { state: nextState, nextTaskId: null, isComplete: false };
-	}
-
-	// Prefer an already-READY task to execute; otherwise push the next TODO to estimate.
-	const readyId = selectNextBestTask(nextState);
-	if (readyId !== null) {
-		const executing = startExecution(nextState, readyId);
-		return { state: executing, nextTaskId: readyId, isComplete: false };
-	}
-
-	const estimating = pushNextToEstimate(nextState);
-	return { state: estimating, nextTaskId: estimating.currentTaskId, isComplete: false };
+	const { state: driven, nextTaskId } = selectNextToDrive(nextState);
+	return { state: driven, nextTaskId, isComplete: false };
 }
 
 /**
@@ -575,13 +737,13 @@ export function proposeAdr(state: DagState, title: string, decision: string): Da
 /**
  * Cascade terminal FAILURE along `dependsOn` edges.
  *
- * When a task becomes terminally FAILED (not fail-fix eligible), every task
- * that depends on it via a `dependsOn` edge can never unblock (isTaskUnblocked
- * requires DONE). This function recursively marks them FAILED too.
+ * When a task becomes terminally FAILED, every task that depends on it via a
+ * `dependsOn` edge can never unblock (isTaskUnblocked requires DONE). This
+ * function recursively marks them FAILED too.
  *
- * Tasks that are BLOCKED and still have active children (decomposition) are
- * skipped — they are blocked by their children, not by the failed dependency;
- * resolveCompletedParents will handle them when children settle.
+ * BLOCKED tasks still waiting on active decomposition children are skipped —
+ * they are blocked by their children, not by the failed dependency edge;
+ * resolveCompletedParents handles them when children settle.
  */
 function cascadeTerminalFailure(state: DagState, failedId: string): DagState {
 	let tasks = state.tasks;
@@ -591,8 +753,6 @@ function cascadeTerminalFailure(state: DagState, failedId: string): DagState {
 		for (const [depId, dep] of Object.entries(tasks)) {
 			if (!dep.dependsOn.includes(id)) continue;
 			if (!isTaskActive(dep.status)) continue;
-			// Skip BLOCKED tasks still waiting on children — they are blocked by
-			// decomposition, not by the failed dependency edge.
 			if (dep.status === "BLOCKED") {
 				const activeChildren = Object.values(tasks).some((t) => t.parentId === depId && isTaskActive(t.status));
 				if (activeChildren) continue;
@@ -603,3 +763,7 @@ function cascadeTerminalFailure(state: DagState, failedId: string): DagState {
 	}
 	return tasks === state.tasks ? state : { ...state, tasks };
 }
+
+// Re-export status names so the tools layer can reference them without a
+// separate import site.
+export type { TaskStatus };
