@@ -1,0 +1,85 @@
+
+ 方式 1 — bun 脚本测试（不启动 pi，最快）
+
+ 验证引擎 + bridge 层 + 工具格式化输出，不需要 API key：
+
+ ```bash
+   cd packages/coding-agent/examples/extensions/history-retrieval
+   bun -e "
+   import { HistoryIndexBridge, detectPython } from './history-index-bridge.ts';
+   const b = new HistoryIndexBridge(detectPython(), '.', '/tmp/demo.json');
+   await b.start();
+   await b.addMessage('user', 'We decided to use PostgreSQL on port 5432');
+   await b.addMessage('assistant', 'Created schema in db/migrations/001.sql');
+   await b.addMessage('user', 'Switch to Redis for caching layer');
+   await b.addMessage('assistant', 'Added redis client in src/cache.ts');
+   await b.markCompacted();
+
+   const results = await b.search('database cache', 3);
+   for (const r of results) {
+     const m = r.is_compacted ? ' [compacted]' : '';
+     console.log(\"> **${r.role}**${m} (relevance: ${r.score.toFixed(2)})\");
+     console.log(\"> ${r.text.replace(/\n/g, '\n> ')}\");
+   }
+   b.stop();
+   "
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 方式 2 — 非交互 -p 模式（需要 API key）
+
+ -p 模式会发送一条 prompt，打印结果后退出。需要真实的 LLM API key 才能让 LLM 调用 ContextRetrieval 工具：
+
+ ```powershell
+   # 在项目根目录
+   .\pi-test.bat -e .\packages\coding-agent\examples\extensions\history-retrieval -t ContextRetrieval -p "Search our conversation history for what database we decided to use"
+ ```
+
+ 或者先不强制工具，直接对话让 LLM 自己决定是否调用：
+
+ ```powershell
+   .\pi-test.bat -e .\packages\coding-agent\examples\extensions\history-retrieval -p "先记住：我们决定用 PostgreSQL，端口 5432，schema 在 db/migrations/001.sql。然后再问你自己：我们之前讨论的数据库是什么？用 ContextRetrieval 工具搜索历史"
+ ```
+
+ 但 -p 模式是单轮的——每条消息结束后进程就退出了，不会有第二轮。所以要让 LLM 实际触发工具调用，需要 多轮的交互模式。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 方式 3 — 交互 TUI 模式（完整测试，推荐）
+
+ 这才能测到完整的事件链：message_end 自动索引 → 压缩 → 工具调用召回。
+
+ ```powershell
+   # 在项目根目录，确保有 API key 环境变量
+   .\pi-test.bat -e .\packages\coding-agent\examples\extensions\history-retrieval
+ ```
+
+ 启动后在 TUI 中操作：
+
+ ```
+   1. 发送: "我们决定用 PostgreSQL，端口 5432，schema 文件在 db/migrations/001.sql"
+      → 等回复完成（此时 message_end 事件已把这条消息索引进 Python）
+   2. 发送: "缓存层改用 Redis，客户端代码在 src/cache.ts"
+      → 等回复完成
+   3. 发送足够多的消息触发上下文压缩，或者手动触发:
+      /compact
+      → session_compact 事件触发 markCompacted()
+   4. 发送: "用 ContextRetrieval 工具搜索我们之前讨论的数据库方案"
+      → LLM 应该调用 ContextRetrieval，返回带 [compacted] 标记的引用块
+ ```
+
+ ### 检查点
+
+ - 启动时底部状态栏不应出现 "History retrieval disabled" 的 warning（如果出现说明 Python 或 numpy/orjson 没装好）
+ - /compact 后再次搜索，结果中应有 [compacted] 标记
+ - 工具返回的 relevance: X.XX 应为两位小数
+ - 会话目录下应有持久化文件：~/.pi/agent/sessions/<sessionId>/history-retrieval.json
+
+ ### 如果没有 API key
+
+ 可以用 --no-env 测试扩展加载本身不报错（虽然无法触发 LLM 工具调用）：
+
+ ```powershell
+   .\pi-test.bat --no-env -e .\packages\coding-agent\examples\extensions\history-retrieval
+ ```

@@ -1,0 +1,325 @@
+================================================================================
+Kimi Soul 对话生命周期模拟: Compact + 自动召回 + 主动召回
+================================================================================
+
+环境假设:
+  - model: claude-sonnet-4-20250514 (200K context)
+  - max_context_size = 200000
+  - compaction_trigger_ratio = 0.85 (170K tokens 触发)
+  - reserved_context_size = 50000 (150K tokens 触发)
+  - auto_retrieve_history = true (BM25 搜索归档历史)
+  - auto_retrieve_working_memory = true (搜索未 compact 的历史)
+  - auto_retrieve_recency_memory = true (近因 + BM25 混合)
+
+
+
+PHASE 1: 正常对话积累
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #1
+  User  : "帮我创建一个 Rust 项目，实现一个简单的 HTTP 服务器"
+  Assist: [创建项目结构，添加依赖，实现 main.rs，启动 server...]
+  # Context: ~800 tokens
+
+Turn #2
+  User  : "给服务器加上 JSON 配置加载功能"
+  Assist: [添加 serde 依赖，创建 Config 结构体，实现 config.rs...]
+  # Context: ~3,200 tokens
+
+Turn #3
+  User  : "实现一个路由表，支持 GET/POST 方法注册"
+  Assist: [设计 Router trait，实现 RouteTable，添加 request dispatch...]
+  # Context: ~8,500 tokens
+
+Turn #4
+  User  : "加上 Middleware 支持，比如日志中间件"
+  Assist: [创建 Middleware trait，实现 LoggerMiddleware，集成到 Router...]
+  # Context: ~18,000 tokens
+
+Turn #5-10: 继续添加功能（静态文件服务、WebSocket 支持、TLS...）
+  # 累计到 Turn #10: ~95,000 tokens
+
+Turn #11
+  User  : "加上数据库连接池，支持 SQLite"
+  Assist: [实现 ConnectionPool，集成 rusqlite，支持事务...]
+  # 累计: ~135,000 tokens
+
+Turn #12
+  User  : "写一些基准测试，看看服务器能处理多少并发"
+  Assist: [添加 criterion 基准测试，设计测试场景，生成报告...]
+  # 累计: ~162,000 tokens
+
+
+
+PHASE 2: Auto-Compaction 触发
+────────────────────────────────────────────────────────────────────────────────
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Agent Loop Step #1 (Turn #13):                                              │
+│                                                                             │
+│   should_auto_compact(                                                      │
+│     token_count_with_pending  = 168,302,                                    │
+│     max_context_size          = 200,000,                                    │
+│     trigger_ratio             = 0.85,   → 170,000 ✓                        │
+│     reserved_context_size     = 50,000, → 168,302+50,000=218,302 ≥ 200,000 ✓│
+│   ) → True                                                                  │
+│                                                                             │
+│   [INFO] Context too long, compacting...                                    │
+│                                                                             │
+│   compact_context():                                                        │
+│     1. HistoryIndex.mark_compacted()   ← 标记当前所有 turn 为已归档         │
+│     2. Context.clear()                ← 旋转 context 文件，清空内存        │
+│     3. Context.write_system_prompt()  ← 重新写入 system prompt              │
+│     4. SimpleCompaction.prepare():                                          │
+│          - adaptive_preserve_depth() → 检查最近一轮:                        │
+│            "写一些基准测试..." → 无 error/think, 基准测试含 .rs 引用 3 次   │
+│            → file_refs > 2 → depth +1 = 2                                  │
+│          - 保留最近的 2 对 user/assistant  (Turn #11, #12)                  │
+│          - 保留第一条消息 (primacy bias: Turn #1)                            │
+│          - 将 Turn #1 ~ #10 压缩为摘要                                      │
+│     5. LLM 调用 kosong.step() 生成压缩摘要                                  │
+│          Input tokens: ~155,000                                             │
+│          Output tokens: ~2,400                                              │
+│     6. Context.append_message(compaction_result)                            │
+│     7. Context.update_token_count(estimated)                                │
+│     8. Notify dynamic injection providers                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+  压缩后 Context 内容：
+  ┌────────────────────────────────────────────────────────────────┐
+  │ [system] (system prompt)                                       │
+  │ [user] Previous context has been compacted.                    │
+  │        Here is the compaction output:                          │
+  │                                                                │
+  │        ## Goal                                                 │
+  │        创建一个 Rust HTTP 服务器项目                            │
+  │                                                                │
+  │        ## Progress                                             │
+  │        - [x] 基础 HTTP 服务器框架                              │
+  │        - [x] JSON 配置加载                                     │
+  │        - [x] 路由表 (GET/POST)                                 │
+  │        - [x] Middleware (日志)                                  │
+  │        - [x] 静态文件服务 + WebSocket + TLS                     │
+  │        - [x] SQLite 连接池                                     │
+  │        - [x] 基准测试                                           │
+  │                                                                │
+  │        ## Key Decisions                                        │
+  │        - 使用 hyper + tokio 作为异步运行时                      │
+  │        - Router 采用 trie 结构做路径匹配                        │
+  │        - 配置使用 TOML 格式                                     │
+  │                                                                │
+  │        ## Next Steps                                           │
+  │        尚未定义下一步                                          │
+  │                                                                │
+  │ [user] "加上数据库连接池，支持 SQLite"   ← 保留的 Turn #11     │
+  │ [assistant] [实现 ConnectionPool...]                            │
+  │ [user] "写一些基准测试..."               ← 保留的 Turn #12     │
+  │ [assistant] [添加基准测试...]                                   │
+  │ Estimated tokens: ~28,400                                      │
+  └────────────────────────────────────────────────────────────────┘
+
+
+
+PHASE 3: 继续对话
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #13 (续)
+  User  : "优化一下基准测试的并发模型"
+  Assist: [调整 tokio 配置，优化 worker 数量，增加连接复用...]
+  # Context: ~32,000 tokens
+
+Turn #14
+  User  : "添加 Prometheus 指标收集"
+  Assist: [集成 prometheus crate，添加 /metrics 端点...]
+  # Context: ~40,000 tokens
+
+...
+
+Turn #20: 项目进入后期
+  User  : "我发现连接池在高并发下会泄漏连接"
+  Assist: [调试中...]
+  # Context: ~82,000 tokens
+
+
+
+PHASE 4: Auto-Retrieval (自动历史召回)
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #21 (step 1 of turn):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ _maybe_auto_retrieve_history():                                            │
+│   lc.auto_retrieve_history       = true    → ✓                            │
+│   lc.auto_retrieve_working_memory = true   → ✓                            │
+│   lc.auto_retrieve_recency_memory = true   → ✓                            │
+│   _current_step_no               = 1       → ✓ (first step only)          │
+│   query = "连接泄漏 连接池 drain 检测"                                     │
+│   len(query) = 15 > 10               → ✓                                  │
+│                                                                             │
+│   HistoryIndex.search_with_recency(query, top_k=10):                       │
+│     BM25 + recency boost → 返回 10 个候选                                 │
+│                                                                             │
+│     ┌──────┬────────────┬──────────┬─────────┬─────────┐                  │
+│     │ Rank │ Turn ID    │ IsComp   │ Score   │ Boosted │                  │
+│     ├──────┼────────────┼──────────┼─────────┼─────────┤                  │
+│     │  1   │ #7         │ Yes      │ 8.2     │ 8.2     │  WebSocket 并发 │
+│     │  2   │ #12        │ Yes      │ 7.5     │ 7.9     │  并发基准测试   │
+│     │  3   │ #11        │ Yes      │ 6.8     │ 6.8     │  SQLite 连接池  │
+│     │  4   │ #4         │ Yes      │ 5.3     │ 6.1     │  Middleware     │
+│     │ ...  │            │          │         │         │                  │
+│     └──────┴────────────┴──────────┴─────────┴─────────┘                  │
+│                                                                             │
+│   Deduplicate: 排除 _recently_retrieved_turn_ids (空，首次)               │
+│   Budget: auto_retrieve_max_tokens_per_turn = 500                          │
+│                                                                             │
+│   ── A. Long-term memory (compacted history) ──                            │
+│     Turn #11 (is_compacted=True) → score 6.8 ≥ threshold 5.0 → ✓          │
+│     Text: "加上数据库连接池，支持 SQLite"                                   │
+│     Citation tokens: ~45 → 在 budget 内                                    │
+│     → Inject as <system-reminder>:                                         │
+│       [Auto-retrieved from past conversation — relevance: 6.80]            │
+│       > **user**                                                            │
+│       > 加上数据库连接池，支持 SQLite                                       │
+│                                                                             │
+│   ── B. Working memory (non-compacted turns, excluding last 2) ──          │
+│     Turn #20 "连接池泄露" 是最近的 → excluded                              │
+│     无其他符合条件的 non-compacted turn                                     │
+│                                                                             │
+│   ── C. Recency memory (boosted score) ──                                  │
+│     Turn #7 → boosted_score 8.2 → ≥ threshold? → yes                      │
+│     Turn #12 → boosted_score 7.9 → ≥ threshold? → yes                      │
+│     → Inject Turn #7 (highest boosted):                                    │
+│       [Recently discussed — relevance: 8.20]                                │
+│       > **user**                                                            │
+│       > WebSocket 的并发连接数有限制吗？                                    │
+│                                                                             │
+│   max_injections_per_turn = 3 → 当前 2 个 OK                               │
+│   Update _recently_retrieved_turn_ids = {#7, #11}                           │
+│                                                                             │
+│   最终动态注入:                                                              │
+│   <system-reminder>                                                         │
+│   [Auto-retrieved from past conversation — relevance: 6.80]                 │
+│   > **user**                                                                │
+│   > 加上数据库连接池，支持 SQLite                                           │
+│                                                                             │
+│   [Recently discussed — relevance: 8.20]                                    │
+│   > **user**                                                                │
+│   > WebSocket 的并发连接数有限制吗？                                        │
+│   </system-reminder>                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Turn #21 发送给 LLM 的最终 context:
+  ┌────────────────────────────────────────────────────────────────┐
+  │ [system] (system prompt)                                       │
+  │ [user] Previous context has been compacted...                  │
+  │        (压缩摘要)                                              │
+  │ [user] (保留的 Turn #11 - 连接池)                              │
+  │ [assistant] ...                                                │
+  │ ... 后续 turn ...                                             │
+  │ [system-reminder]                                              │
+  │   [Auto-retrieved from past conversation — relevance: 6.80]   │
+  │   > **user**                                                   │
+  │   > 加上数据库连接池，支持 SQLITE                              │
+  │ [system-reminder]                                              │
+  │   [Recently discussed — relevance: 8.20]                       │
+  │   > **user**                                                   │
+  │   > WebSocket 的并发连接数有限制吗？                           │
+  │ [user] "我发现在高并发下连接池会泄漏连接..."                   │
+  └────────────────────────────────────────────────────────────────┘
+
+  Assist: "让我先检查连接池的实现..."
+          [LLM 参考了自动召回的连接池相关信息后给出诊断]
+
+
+
+PHASE 5: 主动召回 (使用 ContextRetrieval tool)
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #25
+  User  : "我记得我们之前讨论过 TLS 的证书自动续期方案，
+           具体是用的什么工具和流程？"
+
+  Assist: "让我搜索一下之前的对话记录..."
+
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ LLM 调用 ContextRetrieval(query="TLS 证书自动续期", k=3):                  │
+  │                                                                             │
+  │   HistoryIndex.search(query, top_k=3):                                      │
+  │     BM25 全文搜索 archived turns                                           │
+  │                                                                             │
+  │     [1] Turn #9 (score=9.3, is_compacted=True):                             │
+  │         user: "给服务器加上 TLS 支持，并且证书能自动续期"                   │
+  │         assist: "使用 acme.sh + Let's Encrypt + 定时任务 renew...          │
+  │                 配置步骤: 1. 安装 acme.sh 2. 注册账号 3. 签发证书...       │
+  │                 在 nginx reload hook 中重启服务..."                          │
+  │                                                                             │
+  │     [2] Turn #6 (score=4.1, is_compacted=True):                             │
+  │         user: "配置文件里加上 ssl_cert_path 和 ssl_key_path 字段"           │
+  │                                                                             │
+  │   ContextRetrieval 返回:                                                    │
+  │                                                                             │
+  │   Retrieved 2 past turn(s):                                                 │
+  │   > **user** [compacted] (relevance: 9.30)                                  │
+  │   > 给服务器加上 TLS 支持，并且证书能自动续期                               │
+  │   >                                                                         │
+  │   > **assistant** [compacted] (relevance: 9.30)                             │
+  │   > 使用 acme.sh + Let's Encrypt + 定时任务每 60 天 renew...               │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  Assist: "根据之前的讨论，我们使用的是 acme.sh + Let's Encrypt，
+           通过 crontab 每 60 天自动 renew，并且在 renew 成功后通过
+           --reloadcmd 'systemctl reload myserver' 来热加载新证书..."
+
+
+
+PHASE 6: 第二次 Compaction
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #30:
+  # Context: ~172,000 tokens (再次触发 should_auto_compact)
+  → 第二次 compaction:
+    - cascade_depth ≥ 3? 检查压缩后的历史: 已有 1 条 compacted 标记 → depth=1
+      尚未达到 cascade 阈值 3，使用普通 COMPACT 提示词
+    - 保留 Turn #25 最近的对话（TLS 主动召回 + 讨论）
+    - 前次压缩的摘要 + Turn #13~#24 合并为新的压缩摘要
+    - Context 清空 → 重写 system prompt → 追加新摘要 + 保留消息
+
+  compact_context() 执行流程 (第二次):
+    1. HistoryIndex.mark_compacted()   ← 标记 Turn #21~#30 为已归档
+    2. Context.clear()                ← 旋转 context 文件
+    3. Context.write_system_prompt(is_compacting=True)
+    4. SimpleCompaction.prepare():
+       - 保留最近 2 对 + 第一条消息 (primacy bias)
+       - Turn #1 再次保留（虽然是 compressed 但作为最早意图保留）
+    5. LLM generate summary
+    6. Context.append_message()
+    7. Context.update_token_count(estimated ~35K)
+
+
+
+TIMELINE 总览
+────────────────────────────────────────────────────────────────────────────────
+
+Turn #01-#12:  正常对话 → 积累 ~168K tokens
+    ↓
+Turn #13-s1:   [COMPACT]   ← 第一次自动压缩 (trigger=auto)
+    ↓             将 #1~#10 压缩为摘要，保留 #11~#12
+    ↓             HistoryIndex 标记 #1~#12 is_compacted=true
+    ↓
+Turn #13-#20:  继续对话 → 积累 ~82K tokens
+    ↓
+Turn #21-s1:   [AUTO-RETRIEVE]  ← 自动召回
+    ↓             搜索 history_index → 注入 #11(compacted) 和 #7(recency)
+    ↓             LLM 收到系统提醒后参考历史信息回答问题
+    ↓
+Turn #21-#24:  继续对话
+    ↓
+Turn #25:      [ACTIVE-RETRIEVE]  ← LLM 主动调用 ContextRetrieval 工具
+    ↓             搜索 TLS 证书续期信息 → 返回两个 compacted turn
+    ↓
+Turn #25-#30:  继续对话 → 积累 ~172K tokens
+    ↓
+Turn #31-s1:   [COMPACT]   ← 第二次自动压缩 (trigger=auto)
+                  将 #1~#24 压缩为迭代摘要，保留 #25~#30
+                  两次压缩之间 LLM 能看到完整的历史迭代信息
+                  因为有 cascade_depth < 3，使用普通压缩提示词
