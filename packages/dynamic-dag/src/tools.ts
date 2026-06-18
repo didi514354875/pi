@@ -405,7 +405,8 @@ function registerSpikeTool(pi: ExtensionAPI): void {
 					if (nextTask && nextTask.status === "ESTIMATING") {
 						return textResult(
 							`✅ Spike 探索完成。已收集 ${facts.length} 条事实。\n\n` +
-								"下一个任务需要评估，请使用 assess_task。",
+								buildNextTaskPrompt(nextTask) +
+								"\n\n请使用 assess_task 评估此任务。",
 						);
 					}
 				}
